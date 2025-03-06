@@ -4,6 +4,7 @@ import os
 ckpts = [988240, 100000, 10000, 1000, 100, 10]
 
 for ckpt in ckpts:
+    print(f"Processing {ckpt}")
     dir_path = f"data/{ckpt}"
     for idx in range(100):
         if os.path.exists(f"{dir_path}/{idx}.json"):

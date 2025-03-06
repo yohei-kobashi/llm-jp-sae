@@ -8003,7 +8003,5 @@
         "en": 31,
         "ja": 0
     },
-    "entropy": 0,
-    "granularity": 4,
-    "mono_poly": 2
+    "granularity": 4
 }

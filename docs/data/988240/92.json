@@ -12905,8 +12905,5 @@
         "en": 25,
         "ja": 25
     },
-    "entropy": 1.8595408226334331,
-    "granularity": 3,
-    "mono_poly": 2,
-    "lang_threshold_0.9": "mix"
+    "granularity": 3
 }

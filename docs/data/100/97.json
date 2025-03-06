@@ -12131,7 +12131,5 @@
         "en": 0,
         "ja": 47
     },
-    "entropy": 0,
-    "granularity": 4,
-    "mono_poly": 2
+    "granularity": 4
 }

@@ -1,0 +1,25 @@
+body {
+    padding: 20px;
+    font-family: monospace,sans-serif;
+    background-color: #fff;
+}
+
+.navbar {
+    position: fixed;
+    top: 0;
+    background-color: #fff;
+    margin-right: 30px;
+    margin-left: 30px;
+    margin-bottom: 10px;
+    border-style: solid;
+    border-color: grey;
+}
+
+.picker {
+    text-align: center;
+    padding-bottom: 8px;
+}
+
+.main {
+    margin-top: 160px;
+}

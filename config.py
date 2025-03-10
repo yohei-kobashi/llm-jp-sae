@@ -37,3 +37,9 @@ class TrainConfig:
     batch_size: int = 512
     inf_bs_expansion: int = 2
     logging_step: int = 50
+
+
+@dataclass
+class EvalConfig:
+    num_examples: int = 50
+    act_threshold_p: float = 0.7

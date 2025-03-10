@@ -1,5 +1,9 @@
-from torch.utils.data import Dataset
+from dataclasses import dataclass, field
+from typing import List
+
 import torch
+from torch.utils.data import Dataset
+
 
 class CustomWikiDataset(Dataset):
     def __init__(self, data_path):
@@ -11,3 +15,15 @@ class CustomWikiDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+
+
+@dataclass
+class ActivationRecord:
+    tokens: List[str]
+    act_values: List[float]
+
+
+@dataclass
+class FeatureRecord:
+    feature_id: int
+    act_patterns: List[ActivationRecord] = field(default_factory=list)

@@ -4,6 +4,19 @@ import torch
 from torch import Tensor, nn
 
 
+def normalize_activation(activation: Tensor, nl: str) -> Tensor:
+    if nl == "Standardization":
+        mean = activation.mean(dim=-1, keepdim=True)
+        std = activation.std(dim=-1, keepdim=True) + 1e-6
+        return (activation - mean) / std
+    elif nl == "Scalar":
+        return activation / activation.norm(dim=-1, keepdim=True)
+    elif nl == "None":
+        return activation
+    else:
+        raise ValueError(f"Normalization layer {nl} not supported.")
+
+
 class SimpleHook:
     def __init__(self, module):
         self.hook = module.register_forward_hook(self.hook_fn, with_kwargs=True)

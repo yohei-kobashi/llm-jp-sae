@@ -9,7 +9,7 @@ from transformers import AutoModelForCausalLM, get_constant_schedule_with_warmup
 
 from config import SaeConfig, TrainConfig, UsrConfig, return_save_dir
 from dataset import CustomWikiDataset
-from model import SimpleHook, SparseAutoEncoder
+from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
 MODEL_DEVICE = torch.device("cuda:0")
 SAE_DEVICE = torch.device("cuda:1")
@@ -32,23 +32,12 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> 
     return guess
 
 
-def normalize_activation(activation: Tensor, nl: str) -> Tensor:
-    if nl == "Standardization":
-        mean = activation.mean(dim=-1, keepdim=True)
-        std = activation.std(dim=-1, keepdim=True) + 1e-6
-        return (activation - mean) / std
-    elif nl == "Scalar":
-        return activation / activation.norm(dim=-1, keepdim=True)
-    elif nl == "None":
-        return activation
-    else:
-        raise ValueError(f"Normalization layer {nl} not supported.")
-
-
-def train(dl_train, dl_val, train_cfg, layer, n_d, k, nl, ckpt, lr, save_dir):
+def train(
+    dl_train, dl_val, train_cfg, model_dir, layer, n_d, k, nl, ckpt, lr, save_dir
+):
     # load the language model to extract activations
     model = AutoModelForCausalLM.from_pretrained(
-        f"/model/inaba/llmjp_1.8B/iter_{str(ckpt).zfill(7)}",
+        os.path.join(model_dir, f"iter_{str(ckpt).zfill(7)}"),
         torch_dtype=torch.bfloat16,
     ).to(MODEL_DEVICE)
     model.eval()
@@ -74,12 +63,12 @@ def train(dl_train, dl_val, train_cfg, layer, n_d, k, nl, ckpt, lr, save_dir):
         with torch.inference_mode():
             _ = model(batch.to(MODEL_DEVICE), use_cache=False)
             activation = hook.output if layer == 0 else hook.output[0]
-        # remove sos token
-        activation = activation[:, 1:, :]
-        # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
-        activation = activation.flatten(0, 1)
-        # normalize activations
-        activation = normalize_activation(activation, nl)
+            # remove sos token
+            activation = activation[:, 1:, :]
+            # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
+            activation = activation.flatten(0, 1)
+            # normalize activations
+            activation = normalize_activation(activation, nl)
 
         # split the activations into chunks
         for chunk in torch.chunk(activation, train_cfg.inf_batch_size_expansion, dim=0):
@@ -185,6 +174,7 @@ def main():
         dl_train,
         dl_val,
         train_cfg,
+        usr_cfg.llmjp_model_dir,
         args.layer,
         args.n_d,
         args.k,

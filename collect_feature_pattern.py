@@ -1,14 +1,17 @@
 import argparse
+import json
+import math
 import os
+from collections import Counter
 
 import torch
 from configs import EvalConfig, SaeConfig, TrainConfig, UsrConfig, return_save_dir
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM
-
-from dataset import CustomWikiDataset, FeatureRecord
-from model import SimpleHook, SparseAutoEncoder, normalize_activation
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from dataset import ActivationRecord, CustomWikiDataset, FeatureRecord
+from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
 DEVICE = torch.device("cuda:0")
 
@@ -36,6 +39,7 @@ def collect_feature_pattern(
     sae = SparseAutoEncoder(sae_config).to(DEVICE)
     sae.eval()
     sae.load_state_dict(torch.load(os.path.join(save_dir, "sae.pt")))
+    tokenizer = AutoTokenizer.from_pretrained("llm-jp/llm-jp-3-1.8b")
 
     hook_layer = (
         model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
@@ -67,6 +71,9 @@ def collect_feature_pattern(
 
         cnt_full = 0
         feature_records = [FeatureRecord(feature_id=i) for i in range(num_features)]
+        feature_idxs = torch.arange(num_features)
+        feature_notfull = torch.ones(num_features, dtype=torch.bool)
+        feature_cnt = torch.zeros(num_features, dtype=torch.int32)
 
         with tqdm(dl_test) as pbar:
             for step, batch in enumerate(pbar):
@@ -80,20 +87,91 @@ def collect_feature_pattern(
                 out = sae(activation)
                 latent_indices = out.latent_indices.view(shape[0], shape[1], k)
                 latent_acts = out.latent_acts.view(shape[0], shape[1], k)
-                sae_activation = hook_sae.output.view(
-                    shape[0], shape[1], -1
-                )
-                
+                sae_activation = hook_sae.output.view(shape[0], shape[1], -1)
+                exceed_position = act_thresholds[latent_indices] < latent_acts
 
-        # Collect feature patterns
+                for batch_idx in tqdm(range(shape[0]), leave=False):
+                    feature_idxs_notfull = feature_idxs[feature_notfull]
+                    indices = latent_indices[batch_idx][
+                        exceed_position[batch_idx]
+                    ].unique()
+                    tokens = [
+                        w.replace("▁", " ")
+                        for w in tokenizer.convert_ids_to_tokens(batch[batch_idx][1:])
+                    ]
+                    for idx in indices:
+                        if idx in feature_idxs_notfull:
+                            act_values = sae_activation[batch_idx, :, idx]
+                            feature_records[idx].activations.append(
+                                ActivationRecord(tokens=tokens, act_values=act_values)
+                            )
+                            feature_cnt[idx] += 1
+                            if feature_cnt[idx] == num_examples:
+                                feature_notfull[idx] = False
+                                save_token_act(feature_records[idx], save_dir)
+                                feature_records[idx] = None
+                                cnt_full += 1
+                            elif feature_cnt[idx] > num_examples:
+                                raise ValueError("Feature count exceeds num_examples")
+    for feature_record in tqdm(feature_records, desc="save remaining"):
+        if feature_record is not None and len(feature_record.activations) > 0:
+            save_token_act(feature_record, save_dir=save_dir)
 
 
-# def auto_lang_trend():
-#     pass
+def _format_activation_record(activation_record, max_act):
+    tokens = activation_record.tokens
+    acts = activation_record.activations
+    token_act_list = []
+
+    for token, act in zip(tokens, acts):
+        if act < 0:
+            act = 0
+        else:
+            act = math.ceil(act * 10 / max_act)
+        token_act_list.append([token, act])
+
+    return token_act_list
 
 
-# def manual_gran_trend():
-#     pass
+def format_example(activation_records, max_act):
+    token_act_list = []
+    for idx_sample, activation_record in enumerate(activation_records):
+        token_act = _format_activation_record(activation_record, max_act)
+        token_act_list.append(token_act)
+
+    return token_act_list
+
+
+def save_token_act(
+    feature_record,
+    save_dir,
+):
+    len_data = len(feature_record.activations)
+    max_act = max(
+        [max(feature_record.activations[i].activations) for i in range(len_data)]
+    )
+
+    token_act_list = format_example(
+        feature_record.activations,
+        max_act,
+    )
+    language_list = [feature_record.activations[i].language for i in range(len_data)]
+    count_dict = Counter(language_list)
+    language = [
+        count_dict.get(i, 0) for i in range(5)
+    ]  # 0:code, 1:en, 2:ja, 3:ko, 4:zh
+
+    with open(os.path.join(save_dir, f"{feature_record.feature_id}.json"), "w") as f:
+        json.dump(
+            {
+                "token_act": token_act_list,
+                "language_list": language_list,
+                "language": language,
+            },
+            f,
+            ensure_ascii=False,
+            indent=4,
+        )
 
 
 def main():

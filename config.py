@@ -5,10 +5,10 @@ import torch
 
 @dataclass
 class UsrConfig:
-    raw_data_dir: str = "llm-jp-corpus-v3"
-    tokenized_data_dir: str = "llm-jp-corpus-v3/tokenized"
+    raw_data_dir: str = "/model/llm-jp-corpus/v3.1.0/unfreeze"
+    tokenized_data_dir: str = "/model/inaba/pub/tokenized_data"
     llmjp_model_dir: str = "/model/inaba/llmjp_1.8B"
-    model_save_dir: str = "trained_saes"
+    model_save_dir: str = "/model/inaba/pub/trained_saes"
 
 
 @dataclass

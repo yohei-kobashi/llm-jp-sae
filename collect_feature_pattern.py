@@ -2,7 +2,6 @@ import argparse
 import json
 import math
 import os
-from collections import Counter
 
 import torch
 from configs import EvalConfig, SaeConfig, TrainConfig, UsrConfig, return_save_dir
@@ -40,6 +39,8 @@ def collect_feature_pattern(
     sae.eval()
     sae.load_state_dict(torch.load(os.path.join(save_dir, "sae.pt")))
     tokenizer = AutoTokenizer.from_pretrained("llm-jp/llm-jp-3-1.8b")
+
+    features_dir = os.path.join(save_dir, "features")
 
     hook_layer = (
         model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
@@ -108,14 +109,14 @@ def collect_feature_pattern(
                             feature_cnt[idx] += 1
                             if feature_cnt[idx] == num_examples:
                                 feature_notfull[idx] = False
-                                save_token_act(feature_records[idx], save_dir)
+                                save_token_act(feature_records[idx], features_dir)
                                 feature_records[idx] = None
                                 cnt_full += 1
                             elif feature_cnt[idx] > num_examples:
                                 raise ValueError("Feature count exceeds num_examples")
     for feature_record in tqdm(feature_records, desc="save remaining"):
         if feature_record is not None and len(feature_record.activations) > 0:
-            save_token_act(feature_record, save_dir=save_dir)
+            save_token_act(feature_record, features_dir)
 
 
 def _format_activation_record(activation_record, max_act):
@@ -144,7 +145,7 @@ def format_example(activation_records, max_act):
 
 def save_token_act(
     feature_record,
-    save_dir,
+    features_dir,
 ):
     len_data = len(feature_record.activations)
     max_act = max(
@@ -155,18 +156,13 @@ def save_token_act(
         feature_record.activations,
         max_act,
     )
-    language_list = [feature_record.activations[i].language for i in range(len_data)]
-    count_dict = Counter(language_list)
-    language = [
-        count_dict.get(i, 0) for i in range(5)
-    ]  # 0:code, 1:en, 2:ja, 3:ko, 4:zh
 
-    with open(os.path.join(save_dir, f"{feature_record.feature_id}.json"), "w") as f:
+    with open(
+        os.path.join(features_dir, f"{feature_record.feature_id}.json"), "w"
+    ) as f:
         json.dump(
             {
                 "token_act": token_act_list,
-                "language_list": language_list,
-                "language": language,
             },
             f,
             ensure_ascii=False,

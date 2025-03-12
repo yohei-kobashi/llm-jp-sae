@@ -59,7 +59,7 @@ def evaluate():
     usr_cfg = UsrConfig()
 
     save_dir = return_save_dir(
-        usr_cfg.model_save_dir,
+        usr_cfg.raw_save_dir,
         args.layer,
         args.n_d,
         args.k,

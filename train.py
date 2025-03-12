@@ -11,8 +11,16 @@ from config import SaeConfig, TrainConfig, UsrConfig, return_save_dir
 from dataset import CustomWikiDataset
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
-MODEL_DEVICE = torch.device("cuda:0")
-SAE_DEVICE = torch.device("cuda:1")
+if torch.cuda.is_available():
+    if torch.cuda.device_count() > 1:
+        MODEL_DEVICE = torch.device("cuda:0")
+        SAE_DEVICE = torch.device("cuda:1")
+    else:
+        MODEL_DEVICE = torch.device("cuda")
+        SAE_DEVICE = torch.device("cuda")
+else:
+    MODEL_DEVICE = torch.device("cpu")
+    SAE_DEVICE = torch.device("cpu")
 
 
 @torch.no_grad()
@@ -71,7 +79,7 @@ def train(
             activation = normalize_activation(activation, nl)
 
         # split the activations into chunks
-        for chunk in torch.chunk(activation, train_cfg.inf_batch_size_expansion, dim=0):
+        for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
             # Initialize decoder bias with the geometric median of the chunk
             if global_step == 0:
                 median = geometric_median(chunk.to(SAE_DEVICE))
@@ -156,7 +164,7 @@ def main():
         f"Layer: {args.layer}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
     )
     save_dir = return_save_dir(
-        usr_cfg.model_save_dir,
+        usr_cfg.sae_save_dir,
         args.layer,
         args.n_d,
         args.k,

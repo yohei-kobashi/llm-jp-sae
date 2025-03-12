@@ -17,7 +17,6 @@ DEVICE = torch.device("cuda:0")
 
 def collect_feature_pattern(
     dl_test,
-    train_cfg,
     model_dir,
     layer,
     n_d,
@@ -202,7 +201,7 @@ def main():
     )
 
     save_dir = return_save_dir(
-        usr_cfg.model_save_dir,
+        usr_cfg.raw_save_dir,
         args.layer,
         args.n_d,
         args.k,
@@ -212,7 +211,6 @@ def main():
     )
     collect_feature_pattern(
         dl_test,
-        train_cfg,
         usr_cfg.llmjp_model_dir,
         args.layer,
         args.n_d,

@@ -2,6 +2,8 @@ from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
+from transformers import PreTrainedModel
+from config import SaeConfig
 
 
 def normalize_activation(activation: Tensor, nl: str) -> Tensor:
@@ -39,29 +41,29 @@ class ForwardOutput(NamedTuple):
     loss: Tensor
 
 
-class SparseAutoEncoder(nn.Module):
+class SparseAutoEncoder(PreTrainedModel):
+    config_class = SaeConfig
     def __init__(self, cfg):
-        super().__init__()
+        super().__init__(cfg)
         self.cfg = cfg
         self.d_in = cfg.d_in
         self.num_latents = self.d_in * cfg.expansion_factor
-        self.dtype = cfg.dtype
+        self.torch_dtype = cfg.torch_dtype
 
-        self.encoder = nn.Linear(self.d_in, self.num_latents, dtype=self.dtype)
+        self.encoder = nn.Linear(self.d_in, self.num_latents, dtype=self.torch_dtype)
         self.encoder.bias.data.zero_()
 
         self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
-        if self.cfg.normalize_decoder:
-            self.set_decoder_norm_to_unit_norm()
 
-        self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype))
+        self.set_decoder_norm_to_unit_norm()
+        self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.torch_dtype))
 
     def select_topk(self, latents: Tensor) -> EncoderOutput:
         """Select the top-k latents."""
         return EncoderOutput(*latents.topk(self.cfg.k, sorted=False))
 
     def forward(self, x: Tensor) -> ForwardOutput:
-        sae_in = x.to(self.dtype) - self.b_dec
+        sae_in = x.to(self.torch_dtype) - self.b_dec
 
         latents = self.encoder(sae_in)
         latents = nn.functional.relu(latents)

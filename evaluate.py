@@ -5,6 +5,7 @@ import re
 
 from rich.console import Console
 from rich.text import Text
+from tqdm import tqdm
 
 from config import UsrConfig, return_save_dir
 
@@ -59,7 +60,7 @@ def evaluate():
     usr_cfg = UsrConfig()
 
     save_dir = return_save_dir(
-        usr_cfg.raw_save_dir,
+        usr_cfg.sae_save_dir,
         args.layer,
         args.n_d,
         args.k,
@@ -90,14 +91,14 @@ def detect_language(token_act, idx):
 def auto_language(features_dir, threshold=0.9):
     feature_pths = os.listdir(features_dir)
     feature_langs = [0, 0, 0]  # en, ja, mix
-    for feature_pth in feature_pths:
+    for feature_pth in tqdm(feature_pths):
         if not feature_pth.endswith(".json"):
             continue
         with open(os.path.join(features_dir, feature_pth), "r") as f:
             data = json.load(f)
         en_ja_cnt = [0, 0]
         token_acts = data["token_act"]
-        for token_act in range(len(token_acts)):
+        for token_act in token_acts:
             max_index = max(range(len(token_act)), key=lambda i: token_act[i][1])
             language = detect_language(token_act, max_index)
             if language == "en":
@@ -122,7 +123,7 @@ def auto_language(features_dir, threshold=0.9):
 def manual_granularity(features_dir, check_num=100):
     feature_pths = os.listdir(features_dir)
     gran_list = [0, 0, 0, 0]
-    for feature_pth in feature_pths:
+    for feature_pth in tqdm(feature_pths):
         if not feature_pth.endswith(".json"):
             continue
         with open(os.path.join(features_dir, feature_pth), "r") as f:

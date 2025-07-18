@@ -14,7 +14,7 @@ class UsrConfig:
 
 @dataclass
 class DataConfig:
-    seq_len: int = 64
+    seq_len: int = 4096
     dolma_sample_rate: float = 0.1
     warp_sample_rate: float = 0.01
     batch_size_tokenizer: int = 5000

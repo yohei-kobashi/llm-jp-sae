@@ -255,3 +255,6 @@ def main() -> None:
 
     for fname, tensor in splits.items():
         path = save_dir / fname
+
+if __name__ == "__main__":
+    main()

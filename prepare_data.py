@@ -202,6 +202,7 @@ def prepare_ja_warp_html(tmp_dir: Path, rate: float) -> List[str]:
 
 def main() -> None:
     random.seed(42)
+    torch.manual_seed(42)
     usr_cfg = UsrConfig()
     data_cfg = DataConfig()
 

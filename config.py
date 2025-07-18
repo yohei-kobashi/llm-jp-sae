@@ -6,22 +6,17 @@ from transformers import PretrainedConfig
 
 @dataclass
 class UsrConfig:
-    raw_data_dir: str = ""
-    tokenized_data_dir: str = ""
-    llmjp_model_dir: str = ""
+    raw_data_dir: str = "data"
+    tokenized_data_dir: str = "data/tokenized"
+    model_name_or_dir: str = "llm-jp/llm-jp-3-1.8b"
     sae_save_dir: str = ""
 
 
 @dataclass
 class DataConfig:
     seq_len: int = 64
-    token_num: int = 165_000_000
-    data_pths: dict = field(
-        default_factory=lambda: {
-            "ja_wiki": [f"ja/ja_wiki/train_{str(i)}.jsonl" for i in range(14)],
-            "en_wiki": [f"en/en_wiki/train_{str(i)}.jsonl" for i in range(67)],
-        }
-    )
+    dolma_sample_rate: float = 0.1
+    warp_sample_rate: float = 0.01
     batch_size_tokenizer: int = 5000
     train_val_test_ratio: list = field(default_factory=lambda: [0.8, 0.1, 0.1])
 

@@ -27,15 +27,20 @@ SEED = 42            # reproducibility
 # -----------------------------------------------------------------------------
 
 def _download_url(url: str, dest: Path, retry: int = 3) -> None:
-    """Download *url* → *dest* with progress & resume‑skip."""
+    """Download *url* → *dest* with progress & resume‑skip.
+
+    ‑ Tries SSL‑verified first. If that fails with an SSL error, falls back to
+      **verify=False** (insecure) while showing a warning.
+    """
     if dest.exists() and dest.stat().st_size > 0:
         return  # already fetched
 
     dest.parent.mkdir(parents=True, exist_ok=True)
+    verify = True  # first attempt: strict TLS
     attempt = 0
     while attempt < retry:
         try:
-            with requests.get(url, stream=True, timeout=30) as r:
+            with requests.get(url, stream=True, timeout=30, verify=verify) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
                 tmp = dest.with_suffix(".part")
@@ -54,10 +59,24 @@ def _download_url(url: str, dest: Path, retry: int = 3) -> None:
             os.replace(tmp, dest)
             print(f"  ✓ {dest.name} downloaded")
             return
+        except requests.exceptions.SSLError as e:
+            # fall back to insecure download once
+            if verify:
+                import urllib3, warnings
+                warnings.warn(
+                    f"SSL verification failed for {url}. Falling back to verify=False (insecure).",
+                    RuntimeWarning,
+                )
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                verify = False
+                continue  # retry same attempt without incrementing counter
+            else:
+                attempt += 1
+                print(f"  SSL download error ({attempt}/{retry}) for {url}: {e}")
         except Exception as e:
             attempt += 1
             print(f"  download error ({attempt}/{retry}) for {url}: {e}")
-            time.sleep(2 * attempt)
+            time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"Failed to download {url}")
 
 
@@ -253,8 +272,17 @@ def main() -> None:
         "test_data.pt": combined[n_train + n_val :],
     }
 
+        # 5) SAVE SPLITS -----------------------------------------------------
     for fname, tensor in splits.items():
-        path = save_dir / fname
+        fpath = save_dir / fname
+        if fpath.exists():
+            print(f"  ✓ {fname} exists — skipping save")
+            continue
+        torch.save(tensor, fpath)
+        print(f"  ✓ saved {fname} ({tensor.size(0)} docs)")
+
+        print("✔ All preprocessing complete.")
+
 
 if __name__ == "__main__":
     main()

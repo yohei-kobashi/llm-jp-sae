@@ -204,8 +204,6 @@ def main() -> None:
     random.seed(42)
     usr_cfg = UsrConfig()
     data_cfg = DataConfig()
-    print(usr_cfg)
-    print(data_cfg)
 
     tmp_dir = Path(usr_cfg.raw_data_dir) / "tmp_download"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -267,3 +265,6 @@ def main() -> None:
         print("  ✓ saved shuffled combined dataset")
 
     ratios = data_cfg.train_val
+
+if __name__ == "__main__":
+    main()

@@ -237,9 +237,10 @@ def main() -> None:
     dolma_texts = prepare_dolma(tmp_dir, data_cfg.dolma_sample_rate)
     print(f"  dolma sample: {len(dolma_texts)} lines")
 
-    print("▶ Preparing ja_warp_html sample …")
-    warp_texts = prepare_ja_warp_html(tmp_dir, data_cfg.warp_sample_rate)
-    print(f"  warp_html sample: {len(warp_texts)} lines")
+    if data_cfg.warp_sample_rate:
+        print("▶ Preparing ja_warp_html sample …")
+        warp_texts = prepare_ja_warp_html(tmp_dir, data_cfg.warp_sample_rate)
+        print(f"  warp_html sample: {len(warp_texts)} lines")
 
     # 2) TOKENISER -----------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(usr_cfg.model_name_or_dir)
@@ -251,20 +252,25 @@ def main() -> None:
     dolma_tok = tokenize_corpus(
         "dolma", tokenizer, dolma_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
     )
-    warp_tok = tokenize_corpus(
-        "warp_html", tokenizer, warp_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
-    )
+    if data_cfg.warp_sample_rate:
+        warp_tok = tokenize_corpus(
+            "warp_html", tokenizer, warp_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
+        )
 
     # 4) COMBINE & SPLIT -----------------------------------------------------
-    combo_path = save_dir / "combined.pt"
-    if combo_path.exists():
-        print("  ✓ combined.pt exists — skipping combine/shuffle")
-        combined = torch.load(combo_path)
+    combo_path = _token_file("dolma", save_dir)
+    if data_cfg.warp_sample_rate:
+        combo_path = save_dir / "combined.pt"
+        if combo_path.exists():
+            print("  ✓ combined.pt exists — skipping combine/shuffle")
+            combined = torch.load(combo_path)
+        else:
+            combined = torch.cat([dolma_tok, warp_tok], dim=0)
+            combined = combined[torch.randperm(combined.size(0))]
+            torch.save(combined, combo_path)
+            print("  ✓ saved shuffled combined dataset")
     else:
-        combined = torch.cat([dolma_tok, warp_tok], dim=0)
-        combined = combined[torch.randperm(combined.size(0))]
-        torch.save(combined, combo_path)
-        print("  ✓ saved shuffled combined dataset")
+        combined = dolma_tok
 
     ratios = data_cfg.train_val_test_ratio
     n_total = combined.size(0)
@@ -277,7 +283,7 @@ def main() -> None:
         "test_data.pt": combined[n_train + n_val :],
     }
 
-        # 5) SAVE SPLITS -----------------------------------------------------
+    # 5) SAVE SPLITS -----------------------------------------------------
     for fname, tensor in splits.items():
         fpath = save_dir / fname
         if fpath.exists():

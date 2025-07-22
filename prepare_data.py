@@ -35,8 +35,8 @@ def _download_url(url: str, dest: Path, retry: int = 3) -> None:
     * On SSL certificate failure, retry once with `verify=False`.
     * Write to temporary `*.part` then atomic rename.
     """
-    if dest.exists() and dest.stat().st_size > 0:
-        return
+    # if dest.exists() and dest.stat().st_size > 0:
+    #     return
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 

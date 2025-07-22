@@ -239,9 +239,10 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) PREPARE TEXT CORPORA ------------------------------------------------
-    print("▶ Preparing dolma sample …")
-    dolma_texts = prepare_dolma(tmp_dir, data_cfg.dolma_sample_rate)
-    print(f"  dolma sample: {len(dolma_texts)} lines")
+    if data_cfg.dolma_sample_rate:
+        print("▶ Preparing dolma sample …")
+        dolma_texts = prepare_dolma(tmp_dir, data_cfg.dolma_sample_rate)
+        print(f"  dolma sample: {len(dolma_texts)} lines")
 
     if data_cfg.warp_sample_rate:
         print("▶ Preparing ja_warp_html sample …")
@@ -255,9 +256,10 @@ def main() -> None:
     pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # 3) TOKENISATION (resumable) -------------------------------------------
-    dolma_tok = tokenize_corpus(
-        "dolma", tokenizer, dolma_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
-    )
+    if data_cfg.dolma_sample_rate:
+        dolma_tok = tokenize_corpus(
+            "dolma", tokenizer, dolma_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
+        )
     if data_cfg.warp_sample_rate:
         warp_tok = tokenize_corpus(
             "warp_html", tokenizer, warp_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
@@ -265,7 +267,7 @@ def main() -> None:
 
     # 4) COMBINE & SPLIT -----------------------------------------------------
     combo_path = _token_file("dolma", save_dir)
-    if data_cfg.warp_sample_rate:
+    if data_cfg.dolma_sample_rate and data_cfg.warp_sample_rate:
         combo_path = save_dir / "combined.pt"
         if combo_path.exists():
             print("  ✓ combined.pt exists — skipping combine/shuffle")
@@ -275,8 +277,10 @@ def main() -> None:
             combined = combined[torch.randperm(combined.size(0))]
             torch.save(combined, combo_path)
             print("  ✓ saved shuffled combined dataset")
-    else:
+    elif data_cfg.dolma_sample_rate:
         combined = dolma_tok
+    else:
+        combined = warp_tok
 
     ratios = data_cfg.train_val_test_ratio
     n_total = combined.size(0)
@@ -291,6 +295,8 @@ def main() -> None:
 
     # 5) SAVE SPLITS -----------------------------------------------------
     for fname, tensor in splits.items():
+        if not data_cfg.dolma_sample_rate and data_cfg.warp_sample_rate:
+            fname = "warp_ja_" + fname
         fpath = save_dir / fname
         if fpath.exists():
             print(f"  ✓ {fname} exists — skipping save")

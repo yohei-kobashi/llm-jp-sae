@@ -5,7 +5,7 @@ from typing import Dict, List
 import torch
 from transformers import AutoTokenizer
 
-from config import UsrConfig, DataConfig  # 既存設定を再利用
+from config import UsrConfig, DataConfig
 
 def load_tensor(path: Path) -> torch.Tensor:
     return torch.load(path, map_location="cpu")
@@ -64,7 +64,7 @@ def main():
     pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # candidate files
-    core_files: List[str] = ["train_data.pt", "val_data.pt", "test_data.pt"]
+    core_files: List[str] = ["train_data.pt", "val_data.pt", "test_data.pt", "warp_ja_train_data.pt", "warp_ja_val_data.pt", "warp_ja_test_data.pt"]
     extra_files: List[str] = [
         "tokenized_dolma.pt",
         "tokenized_warp_html.pt",

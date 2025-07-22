@@ -256,19 +256,27 @@ def main() -> None:
     pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # 3) TOKENISATION (resumable) -------------------------------------------
+    dolma_name = "dolma"
+    warp_name = "warp_html"
+    if data_cfg.label:
+        dolma_name = data_cfg.label + dolma_name
+        warp_name = data_cfg.label + warp_name
     if data_cfg.dolma_sample_rate:
         dolma_tok = tokenize_corpus(
-            "dolma", tokenizer, dolma_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
+            dolma_name, tokenizer, dolma_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
         )
     if data_cfg.warp_sample_rate:
         warp_tok = tokenize_corpus(
-            "warp_html", tokenizer, warp_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
+            warp_name, tokenizer, warp_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
         )
 
     # 4) COMBINE & SPLIT -----------------------------------------------------
-    combo_path = _token_file("dolma", save_dir)
+    combo_path = _token_file(dolma_name, save_dir)
     if data_cfg.dolma_sample_rate and data_cfg.warp_sample_rate:
-        combo_path = save_dir / "combined.pt"
+        combined_path = "combined.pt"
+        if data_cfg.label:
+            combined_path = data_cfg.label + combined_path
+        combo_path = save_dir / combined_path
         if combo_path.exists():
             print("  ✓ combined.pt exists — skipping combine/shuffle")
             combined = torch.load(combo_path)
@@ -280,6 +288,7 @@ def main() -> None:
     elif data_cfg.dolma_sample_rate:
         combined = dolma_tok
     else:
+        combo_path = _token_file(warp_name, save_dir)
         combined = warp_tok
 
     ratios = data_cfg.train_val_test_ratio

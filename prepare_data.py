@@ -295,8 +295,8 @@ def main() -> None:
 
     # 5) SAVE SPLITS -----------------------------------------------------
     for fname, tensor in splits.items():
-        if not data_cfg.dolma_sample_rate and data_cfg.warp_sample_rate:
-            fname = "warp_ja_" + fname
+        if data_cfg.label:
+            fname = data_cfg.label + fname
         fpath = save_dir / fname
         if fpath.exists():
             print(f"  ✓ {fname} exists — skipping save")

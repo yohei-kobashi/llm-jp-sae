@@ -8,15 +8,17 @@ from transformers import PretrainedConfig
 class UsrConfig:
     raw_data_dir: str = "data"
     tokenized_data_dir: str = "data/tokenized"
-    model_name_or_dir: str = "llm-jp/llm-jp-3-1.8b"
+    # model_name_or_dir: str = "llm-jp/llm-jp-3-1.8b"
+    model_name_or_dir: str = "allenai/OLMo-2-0425-1B"
     sae_save_dir: str = ""
 
 
 @dataclass
 class DataConfig:
     seq_len: int = 4096
-    dolma_sample_rate: float = 0
-    warp_sample_rate: float = 1
+    label = "olmo2_"
+    dolma_sample_rate: float = 0.2
+    warp_sample_rate: float = 0
     batch_size_tokenizer: int = 5000
     train_val_test_ratio: list = field(default_factory=lambda: [0.8, 0.1, 0.1])
 

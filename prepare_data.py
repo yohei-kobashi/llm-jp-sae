@@ -153,7 +153,13 @@ def tokenize_corpus(
     buf = torch.zeros((n_docs, per_doc), dtype=torch.int32)
 
     processed = 0
-    pbar = tqdm(range(0, n_docs, batch_size), desc=f"Tokenising {name}")
+    part_path = out_path.with_suffix(".part")
+    if part_path.exists():
+        tmp = torch.load(part_path)
+        processed = tmp.size(0)
+        buf[:processed] = tmp
+        print(f"  ✓ resuming from saved partial ({processed}/{n_docs})")
+    pbar = tqdm(range(processed, n_docs, batch_size), desc=f"Tokenising {name}")
     for start in pbar:
         end = min(start + batch_size, n_docs)
         tok = batch_tokenize(tokenizer, corpus[start:end], per_doc, pad_id)

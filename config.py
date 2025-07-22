@@ -16,9 +16,9 @@ class UsrConfig:
 @dataclass
 class DataConfig:
     seq_len: int = 4096
-    label = "olmo2_"
-    dolma_sample_rate: float = 0.2
-    warp_sample_rate: float = 0
+    label = "olmo2_warp_ja_"
+    dolma_sample_rate: float = 0
+    warp_sample_rate: float = 1
     batch_size_tokenizer: int = 5000
     train_val_test_ratio: list = field(default_factory=lambda: [0.8, 0.1, 0.1])
 

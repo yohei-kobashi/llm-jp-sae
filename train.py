@@ -11,6 +11,12 @@ from config import SaeConfig, TrainConfig, UsrConfig, return_save_dir
 from dataset import CustomWikiDataset
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
+try:
+    import wandb
+    _WANDB = True
+except:
+    _WANDB = False
+
 if torch.cuda.is_available():
     if torch.cuda.device_count() > 1:
         MODEL_DEVICE = torch.device("cuda:0")
@@ -51,12 +57,30 @@ def train(
     model.eval()
 
     # initialize the sparse autoencoder
-    sae_config = SaeConfig(n_d=n_d, k=k)
+    sae_config = SaeConfig(expansion_factor=n_d, k=k)
     sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
     optimizer = torch.optim.Adam(sae.parameters(), lr=lr, eps=6.25e-10)
     lr_scheduler = get_constant_schedule_with_warmup(
         optimizer, num_warmup_steps=train_cfg.lr_warmup_steps
     )
+    
+    if _WANDB:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", save_dir.replace("/", "-")),
+            name=f"layer{layer}_nd{n_d}_k{k}_ckpt{ckpt}_lr{lr}",
+            config={
+                "layer": layer,
+                "expansion_factor": n_d,
+                "k": k,
+                "nl": nl,
+                "ckpt": ckpt,
+                "lr": lr,
+                "batch_size": train_cfg.batch_size,
+                "inf_bs_expansion": train_cfg.inf_bs_expansion,
+                "lr_warmup_steps": train_cfg.lr_warmup_steps,
+            },
+        )
+        wandb.watch(sae, log="all", log_freq=train_cfg.logging_step)
 
     # setup hook
     hook_layer = (
@@ -96,6 +120,10 @@ def train(
 
             if global_step % train_cfg.logging_step == 0 and global_step > 0:
                 print(f"Step: {global_step}, Loss: {loss_sum / train_cfg.logging_step}")
+                avg_loss = loss_sum / train_cfg.logging_step
+                print(f"Step: {global_step}, Loss: {avg_loss}")
+                if _WANDB:
+                    wandb.log({"train/loss": avg_loss}, step=global_step)
                 loss_sum = 0.0
             global_step += 1
 
@@ -106,6 +134,7 @@ def train(
     del dl_train, optimizer, lr_scheduler
     sae.eval()
     loss_eval = 0
+    total_eval_steps = 0
 
     with torch.no_grad():
         for batch in tqdm(dl_val):
@@ -117,10 +146,15 @@ def train(
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
                 out = sae(chunk.to(SAE_DEVICE))
                 loss_eval += out.loss.item()
-        print(f"Validation Loss: {loss_eval / len(dl_val)}")
+                total_eval_steps += 1
+        val_avg = loss_eval / max(total_eval_steps, 1)
+        print(f"Validation Loss: {val_avg}")
+        if _WANDB:
+            wandb.log({"val/loss": val_avg}, step=global_step)
 
     print("Training finished.")
-
+    if _WANDB:
+        wandb.finish()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -182,7 +216,7 @@ def main():
         dl_train,
         dl_val,
         train_cfg,
-        usr_cfg.llmjp_model_dir,
+        usr_cfg.model_name_or_dir,
         args.layer,
         args.n_d,
         args.k,

@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 from typing import Dict, List
+import glob
 
 import torch
 from transformers import AutoTokenizer
@@ -43,11 +44,11 @@ def main():
         default=None,
         help="Directory containing tokenized_*.pt / train_data.pt (default = UsrConfig.tokenized_data_dir)",
     )
-    parser.add_argument(
-        "--show-all",
-        action="store_true",
-        help="Also show full combined and per-corpus tokenized files if present."
-    )
+    # parser.add_argument(
+    #     "--show-all",
+    #     action="store_true",
+    #     help="Also show full combined and per-corpus tokenized files if present."
+    # )
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
@@ -64,21 +65,9 @@ def main():
     pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # candidate files
-    core_files: List[str] = ["train_data.pt", "val_data.pt", "test_data.pt", "warp_ja_train_data.pt", "warp_ja_val_data.pt", "warp_ja_test_data.pt"]
-    extra_files: List[str] = [
-        "tokenized_dolma.pt",
-        "tokenized_warp_html.pt",
-        "combined.pt",
-    ]
-
     targets: List[str] = []
-    for f in core_files:
-        if (data_dir / f).exists():
-            targets.append(f)
-    if args.show_all:
-        for f in extra_files:
-            if (data_dir / f).exists():
-                targets.append(f)
+    for f in data_dir.glob("**/*.pt"):
+        targets.append(f)
 
     if not targets:
         raise SystemExit("No target .pt files found.")

@@ -6,6 +6,7 @@ import random
 import time
 from pathlib import Path
 from typing import List, Iterator
+import argparse
 
 import requests
 import torch
@@ -35,8 +36,8 @@ def _download_url(url: str, dest: Path, retry: int = 3) -> None:
     * On SSL certificate failure, retry once with `verify=False`.
     * Write to temporary `*.part` then atomic rename.
     """
-    # if dest.exists() and dest.stat().st_size > 0:
-    #     return
+    if dest.exists() and dest.stat().st_size > 0:
+        return
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -179,8 +180,11 @@ def tokenize_corpus(
 # DATA PREPARATION ------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-def prepare_dolma(tmp_dir: Path, rate: float) -> List[str]:
-    cache = tmp_dir / "dolma_sample.txt"
+def prepare_dolma(tmp_dir: Path, rate: float, label: str) -> List[str]:
+    sample_path = "dolma_sample.txt"
+    if label:
+        sample_path = label + sample_path
+    cache = tmp_dir / sample_path
     if cache.exists() and cache.stat().st_size > 0:
         print("  ✓ dolma_sample.txt found — skipping dolma shards")
         with open(cache, "r", encoding="utf-8") as f:
@@ -202,8 +206,11 @@ def prepare_dolma(tmp_dir: Path, rate: float) -> List[str]:
     print(f"  collected {len(texts)} dolma lines")
     return _load_or_sample(texts, rate, cache)
 
-def prepare_ja_warp_html(tmp_dir: Path, rate: float) -> List[str]:
-    cache = tmp_dir / "warp_sample.txt"
+def prepare_ja_warp_html(tmp_dir: Path, rate: float, label: str) -> List[str]:
+    sample_path = "warp_sample.txt"
+    if label:
+        sample_path = label + sample_path
+    cache = tmp_dir / sample_path
     if cache.exists() and cache.stat().st_size > 0:
         print("  ✓ warp_sample.txt found — skipping warp_html download")
         with open(cache, "r", encoding="utf-8") as f:
@@ -226,12 +233,45 @@ def prepare_ja_warp_html(tmp_dir: Path, rate: float) -> List[str]:
 # -----------------------------------------------------------------------------
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Download texts and tokenize them.")
+    parser.add_argument(
+        "--label",
+        type=Path,
+        default=None,
+        help="label",
+    )
+    parser.add_argument(
+        "--model_name_or_dir",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--dolma_sample_rate",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--warp_sample_rate",
+        type=float,
+        default=None,
+    )
+    args = parser.parse_args()
+    
     # RNG reproducibility
     random.seed(SEED)
     torch.manual_seed(SEED)
 
     usr_cfg = UsrConfig()
     data_cfg = DataConfig()
+    if args.label is not None:
+        data_cfg.label = args.label
+    if args.model_name_or_dir is not None:
+        usr_cfg.model_name_or_dir = args.model_name_or_dir
+    if args.dolma_sample_rate is not None:
+        data_cfg.dolma_sample_rate = args.dolma_sample_rate
+    if args.warp_sample_rate is not None:
+        data_cfg.warp_sample_rate = args.warp_sample_rate
+    usr_cfg.model_name_or_dir
 
     tmp_dir = Path(usr_cfg.raw_data_dir) / "tmp_download"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -241,12 +281,12 @@ def main() -> None:
     # 1) PREPARE TEXT CORPORA ------------------------------------------------
     if data_cfg.dolma_sample_rate:
         print("▶ Preparing dolma sample …")
-        dolma_texts = prepare_dolma(tmp_dir, data_cfg.dolma_sample_rate)
+        dolma_texts = prepare_dolma(tmp_dir, data_cfg.dolma_sample_rate, data_cfg.label)
         print(f"  dolma sample: {len(dolma_texts)} lines")
 
     if data_cfg.warp_sample_rate:
         print("▶ Preparing ja_warp_html sample …")
-        warp_texts = prepare_ja_warp_html(tmp_dir, data_cfg.warp_sample_rate)
+        warp_texts = prepare_ja_warp_html(tmp_dir, data_cfg.warp_sample_rate, data_cfg.label)
         print(f"  warp_html sample: {len(warp_texts)} lines")
 
     # 2) TOKENISER -----------------------------------------------------------
@@ -273,7 +313,6 @@ def main() -> None:
     # 4) COMBINE & SPLIT -----------------------------------------------------
     combo_path = _token_file(dolma_name, save_dir)
     if data_cfg.dolma_sample_rate and data_cfg.warp_sample_rate:
-        combined_path = "combined.pt"
         if data_cfg.label:
             combined_path = data_cfg.label + combined_path
         combo_path = save_dir / combined_path

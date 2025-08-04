@@ -236,7 +236,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Download texts and tokenize them.")
     parser.add_argument(
         "--label",
-        type=Path,
+        type=str,
         default=None,
         help="label",
     )

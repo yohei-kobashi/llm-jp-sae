@@ -51,7 +51,8 @@ def train(
 ):
     # load the language model to extract activations
     model = AutoModelForCausalLM.from_pretrained(
-        os.path.join(model_dir, f"iter_{str(ckpt).zfill(7)}"),
+        # os.path.join(model_dir, f"iter_{str(ckpt).zfill(7)}"),
+        model_dir,
         torch_dtype=torch.bfloat16,
     ).to(MODEL_DEVICE)
     model.eval()

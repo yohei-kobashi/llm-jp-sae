@@ -125,32 +125,32 @@ def train(
                 if _WANDB:
                     wandb.log({"train/loss": avg_loss}, step=global_step)
                 loss_sum = 0.0
+                
+                # evaluation
+                # del dl_train, optimizer, lr_scheduler
+                sae.eval()
+                loss_eval = 0
+                total_eval_steps = 0
+
+                with torch.no_grad():
+                    for batch in tqdm(dl_val):
+                        _ = model(batch.to(MODEL_DEVICE), use_cache=False)
+                        activation = hook.output if layer == 0 else hook.output[0]
+                        activation = activation[:, 1:, :]
+                        activation = activation.flatten(0, 1)
+                        activation = normalize_activation(activation, nl)
+                        for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
+                            out = sae(chunk.to(SAE_DEVICE))
+                            loss_eval += out.loss.item()
+                            total_eval_steps += 1
+                    val_avg = loss_eval / max(total_eval_steps, 1)
+                    print(f"Validation Loss: {val_avg}")
+                    if _WANDB:
+                        wandb.log({"val/loss": val_avg}, step=global_step)
             global_step += 1
 
     # save the trained SAE
     torch.save(sae.state_dict(), os.path.join(save_dir, "sae.pth"))
-
-    # evaluation
-    del dl_train, optimizer, lr_scheduler
-    sae.eval()
-    loss_eval = 0
-    total_eval_steps = 0
-
-    with torch.no_grad():
-        for batch in tqdm(dl_val):
-            _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
-            activation = activation[:, 1:, :]
-            activation = activation.flatten(0, 1)
-            activation = normalize_activation(activation, nl)
-            for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
-                out = sae(chunk.to(SAE_DEVICE))
-                loss_eval += out.loss.item()
-                total_eval_steps += 1
-        val_avg = loss_eval / max(total_eval_steps, 1)
-        print(f"Validation Loss: {val_avg}")
-        if _WANDB:
-            wandb.log({"val/loss": val_avg}, step=global_step)
 
     print("Training finished.")
     if _WANDB:
@@ -173,13 +173,18 @@ def main():
         help="normalization method: Standardization, Scalar, None",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--label", type=str, default=None, help="Data label")
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
     train_cfg = TrainConfig()
-
-    train_data_pth = os.path.join(usr_cfg.tokenized_data_dir, "train_data.pt")
-    val_data_pth = os.path.join(usr_cfg.tokenized_data_dir, "val_data.pt")
+    train_file_name = "train_data.pt"
+    val_file_name = "val_data.pt"
+    if args.label:
+        train_file_name = args.label + train_file_name
+        val_file_name = args.label + val_file_name
+    train_data_pth = os.path.join(usr_cfg.tokenized_data_dir, train_file_name)
+    val_data_pth = os.path.join(usr_cfg.tokenized_data_dir, val_file_name)
 
     dataset_train = CustomWikiDataset(train_data_pth)
     dataset_val = CustomWikiDataset(val_data_pth)

@@ -106,6 +106,7 @@ def _load_or_sample(lines: List[str], rate: float, cache_path: Path) -> List[str
 
     sample_size = max(1, int(len(lines) * rate))
     print(f"  Sampling {sample_size}/{len(lines)} lines …")
+    random.seed(42)
     sampled = random.sample(lines, sample_size)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "w", encoding="utf-8") as f:

@@ -14,8 +14,8 @@ module load gcc
 
 cd llm-jp-sae 
 source env/bin/activate
-python prepare_data.py
-#python prepare_data.py --label ja_ --dolma_sample_rate 0.0 --warp_sample_rate 1.0
+# python prepare_data.py
+# python prepare_data.py --label ja_ --dolma_sample_rate 0.0 --warp_sample_rate 1.0
 python prepare_data.py --label olmo2_ --model_name_or_dir allenai/OLMo-2-0425-1B 
 python prepare_data.py --label olmo2_ja_ --model_name_or_dir allenai/OLMo-2-0425-1B --dolma_sample_rate 0.0 --warp_sample_rate 1.0
 python count_tokens.py --data-dir data/tokenized

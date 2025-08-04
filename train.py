@@ -47,7 +47,7 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> 
 
 
 def train(
-    dl_train, dl_val, train_cfg, model_dir, layer, n_d, k, nl, ckpt, lr, save_dir
+    dl_train, dl_val, train_cfg, model_dir, layers, n_d, k, nl, ckpt, lr, save_dir
 ):
     # load the language model to extract activations
     model = AutoModelForCausalLM.from_pretrained(
@@ -56,20 +56,35 @@ def train(
     ).to(MODEL_DEVICE)
     model.eval()
 
-    # initialize the sparse autoencoder
-    sae_config = SaeConfig(expansion_factor=n_d, k=k)
-    sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
-    optimizer = torch.optim.Adam(sae.parameters(), lr=lr, eps=6.25e-10)
-    lr_scheduler = get_constant_schedule_with_warmup(
-        optimizer, num_warmup_steps=train_cfg.lr_warmup_steps
-    )
-    
+    # initialize the sparse autoencoders
+    saes = {}
+    optims = {}
+    hooks = {}
+    for layer in layers:
+        # SAE
+        cfg = SaeConfig(expansion_factor=n_d, k=k)
+        sae = SparseAutoEncoder(cfg).to(SAE_DEVICE)
+        saes[layer] = sae
+        optims[layer] = torch.optim.Adam(sae.parameters(), lr=lr, eps=6.25e-10)
+
+        # Hook
+        target = model.model.embed_tokens if layer == 0 else model.model.layers[layer-1]
+        hooks[layer] = SimpleHook(target)
+
+    schedulers = {
+        layer: get_constant_schedule_with_warmup(optims[layer], num_warmup_steps=train_cfg.lr_warmup_steps)
+        for layer in layers
+    }
+
+    global_step = 0
+    loss_sum = {layer: 0.0 for layer in layers}
+
     if _WANDB:
         wandb.init(
             project=os.environ.get("WANDB_PROJECT", save_dir.replace("/", "-")),
-            name=f"layer{layer}_nd{n_d}_k{k}_ckpt{ckpt}_lr{lr}",
+            name=f"multi_layers_nd{n_d}_k{k}_ckpt{ckpt}_lr{lr}",
             config={
-                "layer": layer,
+                "layers": layers,
                 "expansion_factor": n_d,
                 "k": k,
                 "nl": nl,
@@ -80,81 +95,83 @@ def train(
                 "lr_warmup_steps": train_cfg.lr_warmup_steps,
             },
         )
-        wandb.watch(sae, log="all", log_freq=train_cfg.logging_step)
-
-    # setup hook
-    hook_layer = (
-        model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
-    )
-    hook = SimpleHook(hook_layer)
-
-    global_step = 0
-    loss_sum = 0.0
 
     for batch in tqdm(dl_train, desc="Training"):
         with torch.inference_mode():
             _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
-            # remove sos token
-            activation = activation[:, 1:, :]
-            # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
-            activation = activation.flatten(0, 1)
-            # normalize activations
-            activation = normalize_activation(activation, nl)
+            activations = {}
+            for layer in layers:
+                out = hooks[layer].output
+                if layer != 0:
+                    out = out[0]
+                # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
+                act = out[:, 1:, :].flatten(0, 1)
+                # normalize activations
+                activations[layer] = normalize_activation(act, nl)
+        
+        for layer in layers:
+            wandb.watch(saes[layer], log="all", log_freq=train_cfg.logging_step)
 
-        # split the activations into chunks
-        for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
-            # Initialize decoder bias with the geometric median of the chunk
-            if global_step == 0:
-                median = geometric_median(chunk.to(SAE_DEVICE))
-                sae.b_dec.data = median.to(sae.dtype)
-            # make sure the decoder weights are unit norm
-            sae.set_decoder_norm_to_unit_norm()
-            optimizer.zero_grad()
-            out = sae(chunk.to(SAE_DEVICE))
-            loss = out.loss
-            loss.backward()
-            loss_sum += loss.item()
-            optimizer.step()
-            lr_scheduler.step()
+            sae = saes[layer]
+            optim = optims[layer]
+            scheduler = schedulers[layer]
+            act = activations[layer]
+            hook = hooks[layer]
+            
+            # split the activations into chunks
+            for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
+                # Initialize decoder bias with the geometric median of the chunk
+                if global_step == 0:
+                    median = geometric_median(chunk.to(SAE_DEVICE))
+                    sae.b_dec.data = median.to(sae.dtype)
+                # make sure the decoder weights are unit norm
+                sae.set_decoder_norm_to_unit_norm()
+                optim.zero_grad()
+                out = sae(chunk.to(SAE_DEVICE))
+                loss = out.loss
+                loss.backward()
+                loss_sum[layer] += loss.item()
+                optim.step()
+                scheduler.step()
 
-            if global_step % train_cfg.logging_step == 0 and global_step > 0:
-                print(f"Step: {global_step}, Loss: {loss_sum / train_cfg.logging_step}")
-                avg_loss = loss_sum / train_cfg.logging_step
-                print(f"Step: {global_step}, Loss: {avg_loss}")
-                if _WANDB:
-                    wandb.log({"train/loss": avg_loss}, step=global_step)
-                loss_sum = 0.0
-                
-                # evaluation
-                # del dl_train, optimizer, lr_scheduler
-                sae.eval()
-                loss_eval = 0
-                total_eval_steps = 0
-
-                with torch.no_grad():
-                    for batch in tqdm(dl_val):
-                        _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-                        activation = hook.output if layer == 0 else hook.output[0]
-                        activation = activation[:, 1:, :]
-                        activation = activation.flatten(0, 1)
-                        activation = normalize_activation(activation, nl)
-                        for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
-                            out = sae(chunk.to(SAE_DEVICE))
-                            loss_eval += out.loss.item()
-                            total_eval_steps += 1
-                    val_avg = loss_eval / max(total_eval_steps, 1)
-                    print(f"Validation Loss: {val_avg}")
+                if global_step % train_cfg.logging_step == 0 and global_step > 0:
+                    avg_loss = loss_sum / train_cfg.logging_step
+                    print(f"Step: {global_step}, Loss: {avg_loss}")
                     if _WANDB:
-                        wandb.log({"val/loss": val_avg}, step=global_step)
-            global_step += 1
+                        wandb.log({f"layer{layer}/train_loss": avg_loss}, step=global_step)
+                    loss_sum[layer] = 0.0
 
-    # save the trained SAE
-    torch.save(sae.state_dict(), os.path.join(save_dir, "sae.pth"))
+                    # evaluation
+                    # del dl_train, optimizer, lr_scheduler
+                    sae.eval()
+                    loss_eval = 0
+                    total_eval_steps = 0
 
-    print("Training finished.")
+                    with torch.no_grad():
+                        for batch in tqdm(dl_val):
+                            _ = model(batch.to(MODEL_DEVICE), use_cache=False)
+                            activation = hook.output if layer == 0 else hook.output[0]
+                            activation = activation[:, 1:, :]
+                            activation = activation.flatten(0, 1)
+                            activation = normalize_activation(activation, nl)
+                            for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
+                                out = sae(chunk.to(SAE_DEVICE))
+                                loss_eval += out.loss.item()
+                                total_eval_steps += 1
+                        val_avg = loss_eval / max(total_eval_steps, 1)
+                        print(f"Step {global_step} L{layer}   val/loss: {val_avg:.6f}")
+                        if _WANDB:
+                            wandb.log({f"layer{layer}/val_loss": val_avg}, step=global_step)
+                global_step += 1
+
     if _WANDB:
         wandb.finish()
+
+    # save the trained SAE
+    for layer, sae in saes.items():
+        torch.save(sae.state_dict(), os.path.join(save_dir, f"sae_layer{layer}.pth"))
+
+    print("Training finished.")
 
 def main():
     parser = argparse.ArgumentParser()

@@ -67,7 +67,7 @@ def main():
     # candidate files
     targets: List[str] = []
     for f in data_dir.glob("**/*.pt"):
-        targets.append(f)
+        targets.append(str(f))
 
     if not targets:
         raise SystemExit("No target .pt files found.")

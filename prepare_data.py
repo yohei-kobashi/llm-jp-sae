@@ -311,24 +311,19 @@ def main() -> None:
         )
 
     # 4) COMBINE & SPLIT -----------------------------------------------------
-    combo_path = _token_file(dolma_name, save_dir)
+
     if data_cfg.dolma_sample_rate and data_cfg.warp_sample_rate:
-        if data_cfg.label:
-            combined_path = data_cfg.label + combined_path
-        combo_path = save_dir / combined_path
-        if combo_path.exists():
-            print("  ✓ combined.pt exists — skipping combine/shuffle")
-            combined = torch.load(combo_path)
-        else:
-            combined = torch.cat([dolma_tok, warp_tok], dim=0)
-            combined = combined[torch.randperm(combined.size(0))]
-            torch.save(combined, combo_path)
-            print("  ✓ saved shuffled combined dataset")
+        combined = torch.cat([dolma_tok, warp_tok], dim=0)
+        combo_path = _token_file("-".join([dolma_name, warp_name]), save_dir)
+        torch.save(combined.contiguous().clone(), combo_path)
     elif data_cfg.dolma_sample_rate:
         combined = dolma_tok
     else:
-        combo_path = _token_file(warp_name, save_dir)
         combined = warp_tok
+    
+    torch.manual_seed(42)
+    combined = combined[torch.randperm(combined.size(0))]
+    print("  ✓ saved shuffled combined dataset")
 
     ratios = data_cfg.train_val_test_ratio
     n_total = combined.size(0)
@@ -336,9 +331,9 @@ def main() -> None:
     n_val = math.floor(n_total * ratios[1])
 
     splits = {
-        "train_data.pt": combined[:n_train],
-        "val_data.pt": combined[n_train : n_train + n_val],
-        "test_data.pt": combined[n_train + n_val :],
+        "train_data.pt": combined[:n_train].contiguous().clone(),
+        "val_data.pt": combined[n_train : n_train + n_val].contiguous().clone(),
+        "test_data.pt": combined[n_train + n_val :].contiguous().clone(),
     }
 
     # 5) SAVE SPLITS -----------------------------------------------------
@@ -346,9 +341,6 @@ def main() -> None:
         if data_cfg.label:
             fname = data_cfg.label + fname
         fpath = save_dir / fname
-        if fpath.exists():
-            print(f"  ✓ {fname} exists — skipping save")
-            continue
         torch.save(tensor, fpath)
         print(f"  ✓ saved {fname} ({tensor.size(0)} docs)")
 

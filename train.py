@@ -177,7 +177,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=int, default=988240, help="Checkpoint")
     parser.add_argument(
-        "--layer", type=int, default=12, help="Layer index to extract activations"
+        "--layers", type=int, nargs="+", default=12, help="Layer indices to extract activations"
     )
     parser.add_argument("--n_d", type=int, default=16, help="Expansion ratio (n/d)")
     parser.add_argument(
@@ -217,21 +217,26 @@ def main():
     )
 
     print(
-        f"Layer: {args.layer}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
+        f"Layers: {args.layers}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
     )
+    sae_root_dir = usr_cfg.sae_save_dir
+    if args.label:
+        sae_root_dir = args.label + sae_root_dir
     save_dir = return_save_dir(
-        usr_cfg.sae_save_dir,
-        args.layer,
+        sae_root_dir,
         args.n_d,
         args.k,
         args.nl,
         args.ckpt,
         args.lr,
     )
-    if os.path.exists(os.path.join(save_dir, "sae.pth")):
-        print(f"Already exists at: {save_dir}")
-        if input("Overwrite? (y/n): ").lower() != "y":
-            exit()
+    layers = []
+    for layer in args.layers:
+        if os.path.exists(os.path.join(save_dir, f"sae_layer{layer}.pth")):
+            print(f"Already exists at: {save_dir}")
+            if input("Overwrite? (y/n): ").lower() != "y":
+                continue
+        layers.append(layer)
     os.makedirs(save_dir, exist_ok=True)
 
     train(
@@ -239,7 +244,7 @@ def main():
         dl_val,
         train_cfg,
         usr_cfg.model_name_or_dir,
-        args.layer,
+        layers,
         args.n_d,
         args.k,
         args.nl,
@@ -247,7 +252,6 @@ def main():
         args.lr,
         save_dir,
     )
-
 
 if __name__ == "__main__":
     main()

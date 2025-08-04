@@ -16,7 +16,7 @@ class UsrConfig:
 @dataclass
 class DataConfig:
     seq_len: int = 4096
-    label = "olmo2_"
+    label = None
     dolma_sample_rate: float = 0.2
     warp_sample_rate: float = 0.0
     batch_size_tokenizer: int = 5000

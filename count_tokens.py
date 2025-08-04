@@ -75,7 +75,7 @@ def main():
     print(f"# Token stats in {data_dir}\n")
     grand_total = 0
     for fname in targets:
-        tensor = load_tensor(data_dir / fname)
+        tensor = load_tensor(fname)
         stats = count_stats(tensor, pad_id)
         grand_total += stats["total_tokens_nonpad"]
         print(format_stats(fname, stats))

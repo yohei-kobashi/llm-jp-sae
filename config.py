@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 class UsrConfig:
     raw_data_dir: str = "data"
     tokenized_data_dir: str = "data/tokenized"
-    model_name_or_dir: str = "allenai/OLMo-2-0425-1B"
+    model_name_or_dir: str = "llm-jp/llm-jp-3-1.8b"
     # model_name_or_dir: str = "allenai/OLMo-2-0425-1B"
     sae_save_dir: str = "sae"
 

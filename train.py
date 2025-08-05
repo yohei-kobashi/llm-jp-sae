@@ -187,6 +187,11 @@ def main():
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--label", type=str, default=None, help="Data label")
+    parser.add_argument(
+        "--model_name_or_dir",
+        type=str,
+        default=None,
+    )
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
@@ -215,6 +220,10 @@ def main():
         sampler=sampler,
     )
 
+    model_name_or_dir = usr_cfg.model_name_or_dir
+    if args.model_name_or_dir:
+        model_name_or_dir = args.model_name_or_dir
+
     print(
         f"Layers: {args.layers}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
     )
@@ -242,7 +251,7 @@ def main():
         dl_train,
         dl_val,
         train_cfg,
-        usr_cfg.model_name_or_dir,
+        model_name_or_dir,
         layers,
         args.n_d,
         args.k,

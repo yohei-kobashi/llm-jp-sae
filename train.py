@@ -96,29 +96,22 @@ def train(
                 "lr_warmup_steps": train_cfg.lr_warmup_steps,
             },
         )
+    for layer in layers:
+        wandb.watch(saes[layer], log="all", log_freq=train_cfg.logging_step)
 
     for batch in tqdm(dl_train, desc="Training"):
         with torch.inference_mode():
             _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activations = {}
-            for layer in layers:
-                out = hooks[layer].output
-                if layer != 0:
-                    out = out[0]
-                # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
-                act = out[:, 1:, :].flatten(0, 1)
-                # normalize activations
-                activations[layer] = normalize_activation(act, nl)
         
         for layer in layers:
-            wandb.watch(saes[layer], log="all", log_freq=train_cfg.logging_step)
-
             sae = saes[layer]
             optim = optims[layer]
             scheduler = schedulers[layer]
-            act = activations[layer]
             hook = hooks[layer]
-            
+            out = hook.output
+            if layer != 0:
+                out = out[0]
+            activation = normalize_activation(out[:, 1:, :].flatten(0, 1), nl)
             # split the activations into chunks
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
                 # Initialize decoder bias with the geometric median of the chunk
@@ -136,7 +129,7 @@ def train(
                 scheduler.step()
 
                 if global_step % train_cfg.logging_step == 0 and global_step > 0:
-                    avg_loss = loss_sum / train_cfg.logging_step
+                    avg_loss = loss_sum[layer] / train_cfg.logging_step
                     print(f"Step: {global_step}, Loss: {avg_loss}")
                     if _WANDB:
                         wandb.log({f"layer{layer}/train_loss": avg_loss}, step=global_step)
@@ -149,14 +142,15 @@ def train(
                     total_eval_steps = 0
 
                     with torch.no_grad():
-                        for batch in tqdm(dl_val):
-                            _ = model(batch.to(MODEL_DEVICE), use_cache=False)
+                        for val_batch in tqdm(dl_val):
+                            with torch.inference_mode():
+                                _ = model(val_batch.to(MODEL_DEVICE), use_cache=False)
                             activation = hook.output if layer == 0 else hook.output[0]
                             activation = activation[:, 1:, :]
                             activation = activation.flatten(0, 1)
                             activation = normalize_activation(activation, nl)
-                            for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
-                                out = sae(chunk.to(SAE_DEVICE))
+                            for val_chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
+                                out = sae(val_chunk.to(SAE_DEVICE))
                                 loss_eval += out.loss.item()
                                 total_eval_steps += 1
                         val_avg = loss_eval / max(total_eval_steps, 1)

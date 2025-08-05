@@ -110,7 +110,6 @@ def train(
             hook = hooks[layer]
             out = hook.output
             out = out[0] if isinstance(out, tuple) else out
-            print(f"layer{layer}:", out.shape)
             activation = normalize_activation(out[:, 1:, :].flatten(0, 1), nl)
             # split the activations into chunks
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):

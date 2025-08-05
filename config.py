@@ -44,6 +44,7 @@ class TrainConfig:
     batch_size: int = 32
     inf_bs_expansion: int = 1
     logging_step: int = 50
+    val_check_batches: int = 10
 
 
 @dataclass

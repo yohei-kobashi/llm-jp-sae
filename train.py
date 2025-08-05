@@ -3,7 +3,7 @@ import os
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, get_constant_schedule_with_warmup
 
@@ -110,6 +110,7 @@ def train(
             hook = hooks[layer]
             out = hook.output
             out = out[0] if isinstance(out, tuple) else out
+            print(f"layer{layer}:", out.shape)
             activation = normalize_activation(out[:, 1:, :].flatten(0, 1), nl)
             # split the activations into chunks
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
@@ -141,7 +142,9 @@ def train(
                     total_eval_steps = 0
 
                     with torch.no_grad():
-                        for val_batch in tqdm(dl_val):
+                        for i, val_batch in enumerate(dl_val):
+                            if i >= train_cfg.val_check_batches:
+                                break
                             with torch.inference_mode():
                                 _ = model(val_batch.to(MODEL_DEVICE), use_cache=False)
                             activation = hook.output[0] if isinstance(hook.output, tuple) else hook.output
@@ -204,10 +207,13 @@ def main():
         batch_size=train_cfg.batch_size * train_cfg.inf_bs_expansion,
         shuffle=True,
     )
+    k = train_cfg.val_check_batches * (train_cfg.batch_size * train_cfg.inf_bs_expansion)
+    indices = torch.randperm(len(dataset_val))[:k].tolist()
+    sampler = SubsetRandomSampler(indices)
     dl_val = DataLoader(
         dataset_val,
         batch_size=train_cfg.batch_size * train_cfg.inf_bs_expansion,
-        shuffle=False,
+        sampler=sampler,
     )
 
     print(

@@ -109,8 +109,10 @@ def train(
             scheduler = schedulers[layer]
             hook = hooks[layer]
             out = hook.output
+            print(f"[layer {layer}] hook output shape", out.shape)
             if layer != 0:
                 out = out[0]
+            print(f"[layer {layer}] hook output shape", out.shape)
             activation = normalize_activation(out[:, 1:, :].flatten(0, 1), nl)
             # split the activations into chunks
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):

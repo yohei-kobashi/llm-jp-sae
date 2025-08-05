@@ -77,7 +77,7 @@ def train(
         for layer in layers
     }
 
-    global_step = 0
+    global_step = {layer: 0 for layer in layers}
     loss_sum = {layer: 0.0 for layer in layers}
 
     if _WANDB:
@@ -115,7 +115,7 @@ def train(
             # split the activations into chunks
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
                 # Initialize decoder bias with the geometric median of the chunk
-                if global_step == 0:
+                if global_step[layer] == 0:
                     median = geometric_median(chunk.to(SAE_DEVICE))
                     sae.b_dec.data = median.to(sae.dtype)
                 # make sure the decoder weights are unit norm
@@ -128,11 +128,11 @@ def train(
                 optim.step()
                 scheduler.step()
 
-                if global_step % train_cfg.logging_step == 0 and global_step > 0:
+                if global_step[layer] % train_cfg.logging_step == 0 and global_step[layer] > 0:
                     avg_loss = loss_sum[layer] / train_cfg.logging_step
-                    print(f"Step: {global_step}, Loss: {avg_loss}")
+                    print(f"layer{layer} Step: {global_step[layer]}, Loss: {avg_loss}")
                     if _WANDB:
-                        wandb.log({f"layer{layer}/train_loss": avg_loss}, step=global_step)
+                        wandb.log({f"layer{layer}/train_loss": avg_loss}, step=global_step[layer])
                     loss_sum[layer] = 0.0
 
                     # evaluation
@@ -156,10 +156,10 @@ def train(
                                 loss_eval += out.loss.item()
                                 total_eval_steps += 1
                         val_avg = loss_eval / max(total_eval_steps, 1)
-                        print(f"Step {global_step} L{layer}   val/loss: {val_avg:.6f}")
+                        print(f"Step {global_step[layer]} L{layer}   val/loss: {val_avg:.6f}")
                         if _WANDB:
-                            wandb.log({f"layer{layer}/val_loss": val_avg}, step=global_step)
-                global_step += 1
+                            wandb.log({f"layer{layer}/val_loss": val_avg}, step=global_step[layer])
+                global_step[layer] += 1
 
     if _WANDB:
         wandb.finish()

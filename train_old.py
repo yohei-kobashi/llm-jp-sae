@@ -165,7 +165,6 @@ def main():
     )
     save_dir = return_save_dir(
         usr_cfg.sae_save_dir,
-        args.layer,
         args.n_d,
         args.k,
         args.nl,

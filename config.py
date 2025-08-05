@@ -41,7 +41,7 @@ class SaeConfig(PretrainedConfig):
 @dataclass
 class TrainConfig:
     lr_warmup_steps: int = 1000
-    batch_size: int = 512
+    batch_size: int = 256
     inf_bs_expansion: int = 2
     logging_step: int = 50
 

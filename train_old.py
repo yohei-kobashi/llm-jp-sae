@@ -70,7 +70,7 @@ def train(
     for batch in tqdm(dl_train, desc="Training"):
         with torch.inference_mode():
             _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
+            activation = hook.output[0] if isinstance(hook.output, tuple) else hook.output
             # remove sos token
             activation = activation[:, 1:, :]
             # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
@@ -110,7 +110,7 @@ def train(
     with torch.no_grad():
         for batch in tqdm(dl_val):
             _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
+            activation = hook.output[0] if isinstance(hook.output, tuple) else hook.output  
             activation = activation[:, 1:, :]
             activation = activation.flatten(0, 1)
             activation = normalize_activation(activation, nl)

@@ -109,10 +109,7 @@ def train(
             scheduler = schedulers[layer]
             hook = hooks[layer]
             out = hook.output
-            print(f"[layer {layer}] hook output shape", out.shape)
-            if layer != 0:
-                out = out[0]
-            print(f"[layer {layer}] hook output shape", out.shape)
+            out = out[0] if isinstance(out, tuple) else out
             activation = normalize_activation(out[:, 1:, :].flatten(0, 1), nl)
             # split the activations into chunks
             for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
@@ -147,7 +144,7 @@ def train(
                         for val_batch in tqdm(dl_val):
                             with torch.inference_mode():
                                 _ = model(val_batch.to(MODEL_DEVICE), use_cache=False)
-                            activation = hook.output if layer == 0 else hook.output[0]
+                            activation = hook.output[0] if isinstance(hook.output, tuple) else hook.output
                             activation = activation[:, 1:, :]
                             activation = activation.flatten(0, 1)
                             activation = normalize_activation(activation, nl)

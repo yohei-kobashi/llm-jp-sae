@@ -26,8 +26,8 @@ else:
 
 def collect_feature_pattern(
     dl_test,
-    model_dir,
-    layer,
+    model_name_or_dir,
+    layers,
     n_d,
     k,
     nl,
@@ -37,95 +37,99 @@ def collect_feature_pattern(
     num_examples,
     act_threshold_p,
 ):
+    # Load model and tokenizer once
     model = AutoModelForCausalLM.from_pretrained(
-        os.path.join(model_dir, f"iter_{str(ckpt).zfill(7)}"),
+        model_name_or_dir,
         torch_dtype=torch.bfloat16,
     ).to(MODEL_DEVICE)
     model.eval()
-    sae_config = SaeConfig(n_d=n_d, k=k)
-    sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
-    sae.eval()
-    sae.load_state_dict(torch.load(os.path.join(save_dir, "sae.pth")))
-    tokenizer = AutoTokenizer.from_pretrained("llm-jp/llm-jp-3-1.8b")
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_dir)
 
-    features_dir = os.path.join(save_dir, "features")
-    os.makedirs(features_dir, exist_ok=True)
+    for layer in layers:
+        # Load per-layer SAE
+        sae_config = SaeConfig(expansion_factor=n_d, k=k)
+        sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
+        sae.eval()
+        sae_path = os.path.join(save_dir, f"sae_layer{layer}.pth")
+        if not os.path.exists(sae_path):
+            raise FileNotFoundError(f"SAE weight not found for layer {layer}: {sae_path}")
+        sae.load_state_dict(torch.load(sae_path))
 
-    hook_layer = (
-        model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
-    )
-    hook = SimpleHook(hook_layer)
-    hook_sae = SimpleHook(sae.encoder)
+        # Prepare output dir per-layer
+        features_dir = os.path.join(save_dir, f"features_layer{layer}")
+        os.makedirs(features_dir, exist_ok=True)
 
-    num_features = sae_config.d_in * n_d
+        # Hooks
+        hook_layer = model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
+        hook = SimpleHook(hook_layer)
+        hook_sae = SimpleHook(sae.encoder)
 
-    with torch.no_grad():
-        # Find the activation threshold (act_threshold) for each feature
-        max_act_values = torch.zeros(num_features, dtype=torch.bfloat16).to(SAE_DEVICE)
-        for step, batch in tqdm(enumerate(dl_test)):
-            _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
-            activation = activation[:, 1:, :]
-            shape = activation.shape  # bs, seq, d
-            activation = activation.flatten(0, 1)
-            activation = normalize_activation(activation, nl).to(SAE_DEVICE)
-            _ = sae(activation)
-            sae_activation = hook_sae.output.view(
-                shape[0], shape[1], -1
-            )  # bs, seq, d_in * n_d
-            max_act_values = torch.max(
-                max_act_values, sae_activation.flatten(0, 1).max(dim=0)[0]
-            )
+        num_features = sae.num_latents
 
-        act_thresholds = max_act_values * act_threshold_p
-
-        cnt_full = 0
-        feature_records = [FeatureRecord(feature_id=i) for i in range(num_features)]
-        feature_idxs = torch.arange(num_features).to(SAE_DEVICE)
-        feature_notfull = torch.ones(num_features, dtype=torch.bool).to(SAE_DEVICE)
-        feature_cnt = torch.zeros(num_features, dtype=torch.int32).to(SAE_DEVICE)
-
-        with tqdm(dl_test) as pbar:
-            for step, batch in enumerate(pbar):
-                pbar.set_postfix(cnt_full=cnt_full)
+        with torch.no_grad():
+            # Pass 1: compute per-feature activation thresholds
+            max_act_values = torch.zeros(num_features, dtype=torch.bfloat16, device=SAE_DEVICE)
+            for step, batch in tqdm(enumerate(dl_test), desc=f"L{layer} pass1"):
                 _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-                activation = hook.output if layer == 0 else hook.output[0]
+                out = hook.output
+                activation = out[0] if isinstance(out, tuple) else out
+                activation = activation[:, 1:, :]
+                shape = activation.shape  # bs, seq, d
+                activation = activation.flatten(0, 1)
+                activation = normalize_activation(activation, nl).to(SAE_DEVICE)
+                _ = sae(activation)
+                sae_activation = hook_sae.output.view(shape[0], shape[1], -1)  # bs, seq, num_latents
+                max_act_values = torch.max(max_act_values, sae_activation.flatten(0, 1).max(dim=0)[0])
+
+            act_thresholds = max_act_values * act_threshold_p
+
+            # Pass 2: collect examples exceeding thresholds
+            cnt_full = 0
+            feature_records = [FeatureRecord(feature_id=i) for i in range(num_features)]
+            feature_notfull = torch.ones(num_features, dtype=torch.bool, device=SAE_DEVICE)
+            feature_cnt = torch.zeros(num_features, dtype=torch.int32, device=SAE_DEVICE)
+
+            for step, batch in enumerate(tqdm(dl_test, desc=f"L{layer} pass2")):
+                _ = model(batch.to(MODEL_DEVICE), use_cache=False)
+                out = hook.output
+                activation = out[0] if isinstance(out, tuple) else out
                 activation = activation[:, 1:, :]
                 shape = activation.shape
                 activation = activation.flatten(0, 1)
                 activation = normalize_activation(activation, nl).to(SAE_DEVICE)
-                out = sae(activation)
-                latent_indices = out.latent_indices.view(shape[0], shape[1], k)
-                latent_acts = out.latent_acts.view(shape[0], shape[1], k)
+                out_sae = sae(activation)
+                latent_indices = out_sae.latent_indices.view(shape[0], shape[1], k)
+                latent_acts = out_sae.latent_acts.view(shape[0], shape[1], k)
                 sae_activation = hook_sae.output.view(shape[0], shape[1], -1)
                 exceed_position = act_thresholds[latent_indices] < latent_acts
 
-                for batch_idx in tqdm(range(shape[0]), leave=False):
-                    feature_idxs_notfull = feature_idxs[feature_notfull]
-                    indices = latent_indices[batch_idx][
-                        exceed_position[batch_idx]
-                    ].unique()
+                for batch_idx in range(shape[0]):
+                    if not feature_notfull.any():
+                        break
+                    indices = latent_indices[batch_idx][exceed_position[batch_idx]].unique()
+                    if indices.numel() == 0:
+                        continue
+                    allowed = set(torch.nonzero(feature_notfull, as_tuple=False).squeeze(-1).tolist())
                     tokens = [
                         w.replace("▁", " ")
                         for w in tokenizer.convert_ids_to_tokens(batch[batch_idx][1:])
                     ]
-                    for idx in indices:
-                        if idx in feature_idxs_notfull:
+                    for idx in indices.tolist():
+                        if idx in allowed:
                             act_values = sae_activation[batch_idx, :, idx].tolist()
-                            feature_records[idx].act_patterns.append(
-                                ActivationRecord(tokens=tokens, act_values=act_values)
-                            )
+                            feature_records[idx].act_patterns.append(ActivationRecord(tokens=tokens, act_values=act_values))
                             feature_cnt[idx] += 1
-                            if feature_cnt[idx] == num_examples:
+                            if feature_cnt[idx].item() == num_examples:
                                 feature_notfull[idx] = False
                                 save_token_act(feature_records[idx], features_dir)
                                 feature_records[idx] = None
                                 cnt_full += 1
-                            elif feature_cnt[idx] > num_examples:
+                            elif feature_cnt[idx].item() > num_examples:
                                 raise ValueError("Feature count exceeds num_examples")
-    for feature_record in tqdm(feature_records, desc="save remaining"):
-        if feature_record is not None and len(feature_record.act_patterns) > 0:
-            save_token_act(feature_record, features_dir)
+
+            for feature_record in tqdm(feature_records, desc=f"L{layer} save remaining"):
+                if feature_record is not None and len(feature_record.act_patterns) > 0:
+                    save_token_act(feature_record, features_dir)
 
 
 def _format_activation_record(activation_record, max_act):
@@ -181,9 +185,9 @@ def save_token_act(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=int, default=988240, help="Checkpoint")
+    parser.add_argument("--ckpt", type=int, default=988240, help="Checkpoint (for save_dir naming)")
     parser.add_argument(
-        "--layer", type=int, default=12, help="Layer index to extract activations"
+        "--layers", type=int, nargs="+", default=None, help="Layer indices to extract activations"
     )
     parser.add_argument("--n_d", type=int, default=16, help="Expansion ratio (n/d)")
     parser.add_argument(
@@ -196,6 +200,12 @@ def main():
         help="normalization method: Standardization, Scalar, None",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--model_name_or_dir",
+        type=str,
+        default=None,
+        help="Model name or path (overrides UsrConfig.model_name_or_dir)",
+    )
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
@@ -210,9 +220,16 @@ def main():
         shuffle=False,
     )
 
+    # Resolve model path/name
+    model_name_or_dir = usr_cfg.model_name_or_dir
+    if args.model_name_or_dir:
+        model_name_or_dir = args.model_name_or_dir
+
+    # Resolve layers
+    layers = args.layers or [12]
+
     save_dir = return_save_dir(
         usr_cfg.sae_save_dir,
-        args.layer,
         args.n_d,
         args.k,
         args.nl,
@@ -221,8 +238,8 @@ def main():
     )
     collect_feature_pattern(
         dl_test,
-        usr_cfg.llmjp_model_dir,
-        args.layer,
+        model_name_or_dir,
+        layers,
         args.n_d,
         args.k,
         args.nl,

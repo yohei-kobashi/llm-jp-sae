@@ -59,6 +59,12 @@ def _print_mem(tag: str):
         print(f"[MEM] {tag} | CPU RSS={cpu} | GPU=CPU only", flush=True)
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
+def _log(msg: str):
+    try:
+        tqdm.write(msg)
+    except Exception:
+        print(msg, flush=True)
+
 if torch.cuda.is_available():
     if torch.cuda.device_count() > 1:
         MODEL_DEVICE = torch.device("cuda:0")
@@ -85,12 +91,16 @@ def collect_feature_pattern_impl(
     DEBUG: bool,
 ):
     # Load model and tokenizer once
+    if DEBUG:
+        _log("[INIT] Loading model and tokenizer...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_dir,
         torch_dtype=torch.bfloat16,
     ).to(MODEL_DEVICE)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_dir)
+    if DEBUG:
+        _log("[INIT] Model/tokenizer loaded.")
 
     # Reset peak stats and print initial memory
     if torch.cuda.is_available():
@@ -112,6 +122,8 @@ def collect_feature_pattern_impl(
 
     for layer in layers:
         # SAE per layer
+        if DEBUG:
+            _log(f"[INIT] Loading SAE for layer {layer}...")
         sae_config = SaeConfig(expansion_factor=n_d, k=k)
         sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
         sae.eval()
@@ -122,6 +134,8 @@ def collect_feature_pattern_impl(
         saes[layer] = sae
         num_features_per_layer[layer] = sae.num_latents
         hooks_sae[layer] = SimpleHook(sae.encoder)
+        if DEBUG:
+            _log(f"[INIT] SAE loaded for layer {layer} | num_latents={sae.num_latents}")
 
         # Hook target layer of the model
         target = model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
@@ -134,13 +148,17 @@ def collect_feature_pattern_impl(
     # Use inference_mode to minimize gradient-related buffers
     with torch.inference_mode():
         if DEBUG:
-            print(f"[INFO] Start collection | layers={layers} | k={k} | nl={nl}", flush=True)
+            _log(f"[INFO] Start collection | layers={layers} | k={k} | nl={nl}")
         for step, batch in enumerate(tqdm(dl_test, desc="collect(top-N)")):
+            if DEBUG:
+                _log(f"[STEP {step}] moving batch to {MODEL_DEVICE}")
             batch = batch.to(MODEL_DEVICE)
             if DEBUG:
                 _print_mem(f"before forward step={step}")
+                _log(f"[STEP {step}] model forward start")
             _ = model(batch, use_cache=False)
             if DEBUG:
+                _log(f"[STEP {step}] model forward done")
                 _print_mem(f"after forward step={step}")
 
             # tokens for this batch samples will be computed lazily per sample
@@ -156,27 +174,37 @@ def collect_feature_pattern_impl(
                 activation = activation[:, 1:, :]
                 bs, seq, d = activation.shape  # bs, seq, d
                 if DEBUG:
-                    print(f"[DBG] step={step} L={layer} activation shape={tuple(activation.shape)} d_in={d} num_latents={sae.num_latents}", flush=True)
+                    _log(f"[STEP {step}] L{layer} activation shape={tuple(activation.shape)} d_in={d} num_latents={sae.num_latents}")
 
                 # Chunk over the batch dimension to reduce VRAM peak, similar to train.py
                 inf_chunks = TrainConfig().inf_bs_expansion
                 b_start = 0
-                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
+                for ci, act_chunk in enumerate(torch.chunk(activation, inf_chunks, dim=0)):
                     sub_bs = act_chunk.shape[0]
                     flat = act_chunk.flatten(0, 1)
                     flat = normalize_activation(flat, nl).to(SAE_DEVICE)
                     if DEBUG:
+                        _log(f"[STEP {step}] L{layer} chunk {ci}/{inf_chunks} SAE forward start sub_bs={sub_bs}")
                         _print_mem(f"before SAE fwd step={step} L={layer} sub_bs={sub_bs}")
-                    out_sae = sae(flat)
+                    try:
+                        out_sae = sae(flat)
+                    except Exception as e:
+                        _log(f"[ERR] SAE forward failed at step={step} L={layer} chunk={ci} err={e}")
+                        raise
                     latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
                     latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
                     # Accessing encoder output (dense). This may be heavy; log before and after.
                     if DEBUG:
-                        _print_mem(f"before encoder hook read step={step} L={layer}")
-                    sae_activation = hook_sae.output.view(sub_bs, seq, -1)
+                        _print_mem(f"after SAE fwd step={step} L={layer}")
+                        _log(f"[STEP {step}] L{layer} encoder hook read start")
+                    try:
+                        sae_activation = hook_sae.output.view(sub_bs, seq, -1)
+                    except Exception as e:
+                        _log(f"[ERR] encoder hook read failed at step={step} L={layer} chunk={ci} err={e}")
+                        raise
                     if DEBUG:
                         approx_bytes = sub_bs * seq * sae.num_latents * 2  # bf16 ~ 2 bytes
-                        print(f"[DBG] step={step} L={layer} sae_activation shape={tuple(sae_activation.shape)} ~{_bytes_to_str(approx_bytes)}", flush=True)
+                        _log(f"[STEP {step}] L{layer} sae_activation shape={tuple(sae_activation.shape)} ~{_bytes_to_str(approx_bytes)}")
                         _print_mem(f"after encoder hook read step={step} L={layer}")
 
                     # For each sample in this chunk, compute per-feature max activation (from sparse top-k)
@@ -223,6 +251,10 @@ def collect_feature_pattern_impl(
                                 if item[0] > heap[0][0]:
                                     heapq.heapreplace(heap, item)
                     b_start += sub_bs
+                if DEBUG:
+                    _log(f"[STEP {step}] L{layer} done")
+            if DEBUG:
+                _log(f"[STEP {step}] all layers done")
 
     # Save per-layer features
     for layer in layers:
@@ -241,6 +273,8 @@ def collect_feature_pattern_impl(
             for _, _, rec in items_sorted:
                 fr.act_patterns.append(rec)
             save_token_act(fr, features_dir)
+        if DEBUG:
+            _log(f"[SAVE] L{layer} saved features to {features_dir}")
 
 
 def _format_activation_record(activation_record, max_act):

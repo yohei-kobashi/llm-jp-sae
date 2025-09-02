@@ -11,7 +11,52 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dataset import ActivationRecord, CustomWikiDataset, FeatureRecord
 import heapq
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+import time
+
+def _read_proc_rss_kb() -> Optional[int]:
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1])  # kB
+    except Exception:
+        return None
+    return None
+
+def _get_rss_bytes() -> Optional[int]:
+    # Try psutil first if available
+    try:
+        import psutil  # type: ignore
+        p = psutil.Process()
+        return int(p.memory_info().rss)
+    except Exception:
+        kb = _read_proc_rss_kb()
+        return kb * 1024 if kb is not None else None
+
+def _bytes_to_str(n: Optional[int]) -> str:
+    if n is None:
+        return "?"
+    for unit in ['B','KB','MB','GB','TB']:
+        if n < 1024.0:
+            return f"{n:3.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
+
+def _print_mem(tag: str):
+    cpu = _bytes_to_str(_get_rss_bytes())
+    if torch.cuda.is_available():
+        try:
+            alloc = _bytes_to_str(torch.cuda.memory_allocated())
+            reserved = _bytes_to_str(torch.cuda.memory_reserved())
+            peak = _bytes_to_str(torch.cuda.max_memory_allocated())
+            print(f"[MEM] {tag} | CPU RSS={cpu} | GPU alloc={alloc} reserved={reserved} peak={peak}", flush=True)
+        except Exception as e:
+            print(f"[MEM] {tag} | CPU RSS={cpu} | GPU n/a ({e})", flush=True)
+    else:
+        print(f"[MEM] {tag} | CPU RSS={cpu} | GPU=CPU only", flush=True)
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
 if torch.cuda.is_available():
@@ -26,7 +71,7 @@ else:
     SAE_DEVICE = torch.device("cpu")
 
 
-def collect_feature_pattern(
+def collect_feature_pattern_impl(
     dl_test,
     model_name_or_dir,
     layers,
@@ -37,6 +82,7 @@ def collect_feature_pattern(
     lr,
     save_dir,
     top_n,
+    DEBUG: bool,
 ):
     # Load model and tokenizer once
     model = AutoModelForCausalLM.from_pretrained(
@@ -45,6 +91,14 @@ def collect_feature_pattern(
     ).to(MODEL_DEVICE)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_dir)
+
+    # Reset peak stats and print initial memory
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+    # Debug printing controlled later via CLI flag
 
     # Prepare per-layer SAE, hooks, and heaps
     saes: Dict[int, SparseAutoEncoder] = {}
@@ -79,9 +133,15 @@ def collect_feature_pattern(
     # Single pass over the dataset; each batch computed once for all layers
     # Use inference_mode to minimize gradient-related buffers
     with torch.inference_mode():
+        if DEBUG:
+            print(f"[INFO] Start collection | layers={layers} | k={k} | nl={nl}", flush=True)
         for step, batch in enumerate(tqdm(dl_test, desc="collect(top-N)")):
             batch = batch.to(MODEL_DEVICE)
+            if DEBUG:
+                _print_mem(f"before forward step={step}")
             _ = model(batch, use_cache=False)
+            if DEBUG:
+                _print_mem(f"after forward step={step}")
 
             # tokens for this batch samples will be computed lazily per sample
             tokens_cache: Dict[int, List[str]] = {}
@@ -95,6 +155,8 @@ def collect_feature_pattern(
                 activation = out[0] if isinstance(out, tuple) else out
                 activation = activation[:, 1:, :]
                 bs, seq, d = activation.shape  # bs, seq, d
+                if DEBUG:
+                    print(f"[DBG] step={step} L={layer} activation shape={tuple(activation.shape)} d_in={d} num_latents={sae.num_latents}", flush=True)
 
                 # Chunk over the batch dimension to reduce VRAM peak, similar to train.py
                 inf_chunks = TrainConfig().inf_bs_expansion
@@ -103,11 +165,19 @@ def collect_feature_pattern(
                     sub_bs = act_chunk.shape[0]
                     flat = act_chunk.flatten(0, 1)
                     flat = normalize_activation(flat, nl).to(SAE_DEVICE)
-
+                    if DEBUG:
+                        _print_mem(f"before SAE fwd step={step} L={layer} sub_bs={sub_bs}")
                     out_sae = sae(flat)
                     latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
                     latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
+                    # Accessing encoder output (dense). This may be heavy; log before and after.
+                    if DEBUG:
+                        _print_mem(f"before encoder hook read step={step} L={layer}")
                     sae_activation = hook_sae.output.view(sub_bs, seq, -1)
+                    if DEBUG:
+                        approx_bytes = sub_bs * seq * sae.num_latents * 2  # bf16 ~ 2 bytes
+                        print(f"[DBG] step={step} L={layer} sae_activation shape={tuple(sae_activation.shape)} ~{_bytes_to_str(approx_bytes)}", flush=True)
+                        _print_mem(f"after encoder hook read step={step} L={layer}")
 
                     # For each sample in this chunk, compute per-feature max activation (from sparse top-k)
                     for bb in range(sub_bs):
@@ -242,6 +312,7 @@ def main():
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--top_n", type=int, default=None, help="Top-N examples per feature (overrides thresholding)")
+    parser.add_argument("--debug_mem", action="store_true", help="Enable verbose memory and shape logging for debugging")
     parser.add_argument(
         "--model_name_or_dir",
         type=str,
@@ -280,7 +351,7 @@ def main():
     )
     top_n = args.top_n if args.top_n is not None else eval_cfg.num_examples
 
-    collect_feature_pattern(
+    collect_feature_pattern_impl(
         dl_test,
         model_name_or_dir,
         layers,
@@ -291,7 +362,9 @@ def main():
         args.lr,
         save_dir,
         top_n,
+        args.debug_mem,
     )
+
 
 
 if __name__ == "__main__":

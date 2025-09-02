@@ -10,6 +10,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dataset import ActivationRecord, CustomWikiDataset, FeatureRecord
+import heapq
+from typing import Dict, List, Tuple
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
 if torch.cuda.is_available():
@@ -34,8 +36,7 @@ def collect_feature_pattern(
     ckpt,
     lr,
     save_dir,
-    num_examples,
-    act_threshold_p,
+    top_n,
 ):
     # Load model and tokenizer once
     model = AutoModelForCausalLM.from_pretrained(
@@ -45,8 +46,18 @@ def collect_feature_pattern(
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_dir)
 
+    # Prepare per-layer SAE, hooks, and heaps
+    saes: Dict[int, SparseAutoEncoder] = {}
+    hooks_model: Dict[int, SimpleHook] = {}
+    hooks_sae: Dict[int, SimpleHook] = {}
+    num_features_per_layer: Dict[int, int] = {}
+    # For each layer, maintain a list of min-heaps per feature id
+    # Each heap stores tuples: (score, counter, ActivationRecord)
+    heaps_per_layer: Dict[int, List[List[Tuple[float, int, ActivationRecord]]]] = {}
+    counter = 0  # global tie-breaker
+
     for layer in layers:
-        # Load per-layer SAE
+        # SAE per layer
         sae_config = SaeConfig(expansion_factor=n_d, k=k)
         sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
         sae.eval()
@@ -54,82 +65,108 @@ def collect_feature_pattern(
         if not os.path.exists(sae_path):
             raise FileNotFoundError(f"SAE weight not found for layer {layer}: {sae_path}")
         sae.load_state_dict(torch.load(sae_path))
+        saes[layer] = sae
+        num_features_per_layer[layer] = sae.num_latents
+        hooks_sae[layer] = SimpleHook(sae.encoder)
 
-        # Prepare output dir per-layer
-        features_dir = os.path.join(save_dir, f"features_layer{layer}")
-        os.makedirs(features_dir, exist_ok=True)
+        # Hook target layer of the model
+        target = model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
+        hooks_model[layer] = SimpleHook(target)
 
-        # Hooks
-        hook_layer = model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
-        hook = SimpleHook(hook_layer)
-        hook_sae = SimpleHook(sae.encoder)
+        # Init heaps per feature
+        heaps_per_layer[layer] = [[] for _ in range(sae.num_latents)]
 
-        num_features = sae.num_latents
+    # Single pass over the dataset; each batch computed once for all layers
+    with torch.no_grad():
+        for step, batch in enumerate(tqdm(dl_test, desc="collect(top-N)")):
+            batch = batch.to(MODEL_DEVICE)
+            _ = model(batch, use_cache=False)
 
-        with torch.no_grad():
-            # Pass 1: compute per-feature activation thresholds
-            max_act_values = torch.zeros(num_features, dtype=torch.bfloat16, device=SAE_DEVICE)
-            for step, batch in tqdm(enumerate(dl_test), desc=f"L{layer} pass1"):
-                _ = model(batch.to(MODEL_DEVICE), use_cache=False)
+            # tokens for this batch samples will be computed lazily per sample
+            tokens_cache: Dict[int, List[str]] = {}
+
+            for layer in layers:
+                hook = hooks_model[layer]
+                sae = saes[layer]
+                hook_sae = hooks_sae[layer]
+
                 out = hook.output
                 activation = out[0] if isinstance(out, tuple) else out
                 activation = activation[:, 1:, :]
                 shape = activation.shape  # bs, seq, d
                 activation = activation.flatten(0, 1)
                 activation = normalize_activation(activation, nl).to(SAE_DEVICE)
-                _ = sae(activation)
-                sae_activation = hook_sae.output.view(shape[0], shape[1], -1)  # bs, seq, num_latents
-                max_act_values = torch.max(max_act_values, sae_activation.flatten(0, 1).max(dim=0)[0])
 
-            act_thresholds = max_act_values * act_threshold_p
-
-            # Pass 2: collect examples exceeding thresholds
-            cnt_full = 0
-            feature_records = [FeatureRecord(feature_id=i) for i in range(num_features)]
-            feature_notfull = torch.ones(num_features, dtype=torch.bool, device=SAE_DEVICE)
-            feature_cnt = torch.zeros(num_features, dtype=torch.int32, device=SAE_DEVICE)
-
-            for step, batch in enumerate(tqdm(dl_test, desc=f"L{layer} pass2")):
-                _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-                out = hook.output
-                activation = out[0] if isinstance(out, tuple) else out
-                activation = activation[:, 1:, :]
-                shape = activation.shape
-                activation = activation.flatten(0, 1)
-                activation = normalize_activation(activation, nl).to(SAE_DEVICE)
                 out_sae = sae(activation)
                 latent_indices = out_sae.latent_indices.view(shape[0], shape[1], k)
                 latent_acts = out_sae.latent_acts.view(shape[0], shape[1], k)
                 sae_activation = hook_sae.output.view(shape[0], shape[1], -1)
-                exceed_position = act_thresholds[latent_indices] < latent_acts
 
-                for batch_idx in range(shape[0]):
-                    if not feature_notfull.any():
-                        break
-                    indices = latent_indices[batch_idx][exceed_position[batch_idx]].unique()
-                    if indices.numel() == 0:
+                # For each sample in batch, compute per-feature max activation (from sparse top-k)
+                for b in range(shape[0]):
+                    # Build per-feature max score using sparse indices/acts
+                    flat_idx = latent_indices[b].reshape(-1)
+                    flat_act = latent_acts[b].reshape(-1)
+                    # Accumulate maxima in a python dict to avoid giant dense ops
+                    feat_max: Dict[int, float] = {}
+                    idx_list = flat_idx.tolist()
+                    act_list = flat_act.tolist()
+                    for idx_i, act_i in zip(idx_list, act_list):
+                        # act_i is a python float already if dtype is fp16/bf16; ensure float
+                        prev = feat_max.get(idx_i)
+                        if prev is None or act_i > prev:
+                            feat_max[idx_i] = float(act_i)
+
+                    if not feat_max:
                         continue
-                    allowed = set(torch.nonzero(feature_notfull, as_tuple=False).squeeze(-1).tolist())
-                    tokens = [
-                        w.replace("▁", " ")
-                        for w in tokenizer.convert_ids_to_tokens(batch[batch_idx][1:])
-                    ]
-                    for idx in indices.tolist():
-                        if idx in allowed:
-                            act_values = sae_activation[batch_idx, :, idx].tolist()
-                            feature_records[idx].act_patterns.append(ActivationRecord(tokens=tokens, act_values=act_values))
-                            feature_cnt[idx] += 1
-                            if feature_cnt[idx].item() == num_examples:
-                                feature_notfull[idx] = False
-                                save_token_act(feature_records[idx], features_dir)
-                                feature_records[idx] = None
-                                cnt_full += 1
-                            elif feature_cnt[idx].item() > num_examples:
-                                raise ValueError("Feature count exceeds num_examples")
 
-            for feature_record in tqdm(feature_records, desc=f"L{layer} save remaining"):
-                if feature_record is not None and len(feature_record.act_patterns) > 0:
-                    save_token_act(feature_record, features_dir)
+                    # Compute tokens lazily only if we are going to insert something
+                    # We don't know yet, so we prepare a quick reference to heaps to compare
+                    # We'll compute tokens only when pushing
+                    for idx_i, score in feat_max.items():
+                        heap = heaps_per_layer[layer][idx_i]
+                        # Quick skip if heap is full and score is not better than current min
+                        if len(heap) >= top_n and score <= heap[0][0]:
+                            continue
+
+                        # Prepare tokens for this sample only once
+                        if b not in tokens_cache:
+                            tokens_cache[b] = [
+                                w.replace("▁", " ")
+                                for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
+                            ]
+                        tokens = tokens_cache[b]
+                        # Extract per-token activation values for this feature from SAE encoder output
+                        act_values = sae_activation[b, :, idx_i].tolist()
+                        record = ActivationRecord(tokens=tokens, act_values=act_values)
+
+                        counter += 1
+                        item = (float(max(0.0, max(act_values))), counter, record)
+
+                        if len(heap) < top_n:
+                            heapq.heappush(heap, item)
+                        else:
+                            # Replace smallest if current is larger
+                            if item[0] > heap[0][0]:
+                                heapq.heapreplace(heap, item)
+
+    # Save per-layer features
+    for layer in layers:
+        features_dir = os.path.join(save_dir, f"features_layer{layer}")
+        os.makedirs(features_dir, exist_ok=True)
+        num_features = num_features_per_layer[layer]
+        heaps = heaps_per_layer[layer]
+
+        for feat_id in tqdm(range(num_features), desc=f"L{layer} save"):
+            heap = heaps[feat_id]
+            if not heap:
+                continue
+            # Sort descending by score
+            items_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
+            fr = FeatureRecord(feature_id=feat_id)
+            for _, _, rec in items_sorted:
+                fr.act_patterns.append(rec)
+            save_token_act(fr, features_dir)
 
 
 def _format_activation_record(activation_record, max_act):
@@ -200,6 +237,7 @@ def main():
         help="normalization method: Standardization, Scalar, None",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--top_n", type=int, default=None, help="Top-N examples per feature (overrides thresholding)")
     parser.add_argument(
         "--model_name_or_dir",
         type=str,
@@ -236,6 +274,8 @@ def main():
         args.ckpt,
         args.lr,
     )
+    top_n = args.top_n if args.top_n is not None else eval_cfg.num_examples
+
     collect_feature_pattern(
         dl_test,
         model_name_or_dir,
@@ -246,8 +286,7 @@ def main():
         args.ckpt,
         args.lr,
         save_dir,
-        eval_cfg.num_examples,
-        eval_cfg.act_threshold_p,
+        top_n,
     )
 
 

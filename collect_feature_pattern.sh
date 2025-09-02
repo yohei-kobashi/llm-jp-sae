@@ -13,8 +13,8 @@ module load python/3.10.16 cuda
 
 cd llm-jp-sae 
 source env_g/bin/activate
-python collect_feature_pattern.py --layers 0 1 2 3
-python collect_feature_pattern.py --layers 4 5 6
+python collect_feature_pattern.py --layers 0 1 2
+python collect_feature_pattern.py --layers 3 4 5 6
 python collect_feature_pattern.py --layers 7 8 9 10
 python collect_feature_pattern.py --layers 11 12 13 14
 python collect_feature_pattern.py --layers 15 16 17 18

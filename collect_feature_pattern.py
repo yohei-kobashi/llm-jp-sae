@@ -113,7 +113,6 @@ def collect_feature_pattern_impl(
     # Prepare per-layer SAE, hooks, and heaps
     saes: Dict[int, SparseAutoEncoder] = {}
     hooks_model: Dict[int, SimpleHook] = {}
-    hooks_sae: Dict[int, SimpleHook] = {}
     num_features_per_layer: Dict[int, int] = {}
     # For each layer, maintain a list of min-heaps per feature id
     # Each heap stores tuples: (score, counter, ActivationRecord)
@@ -133,7 +132,6 @@ def collect_feature_pattern_impl(
         sae.load_state_dict(torch.load(sae_path))
         saes[layer] = sae
         num_features_per_layer[layer] = sae.num_latents
-        hooks_sae[layer] = SimpleHook(sae.encoder)
         if DEBUG:
             _log(f"[INIT] SAE loaded for layer {layer} | num_latents={sae.num_latents}")
 
@@ -144,137 +142,173 @@ def collect_feature_pattern_impl(
         # Init heaps per feature
         heaps_per_layer[layer] = [[] for _ in range(sae.num_latents)]
 
-    # Single pass over the dataset; each batch computed once for all layers
-    # Use inference_mode to minimize gradient-related buffers
+    # PASS 1: compute top-N sample indices per feature using only sparse outputs
     with torch.inference_mode():
         if DEBUG:
-            _log(f"[INFO] Start collection | layers={layers} | k={k} | nl={nl}")
-        for step, batch in enumerate(tqdm(dl_test, desc="collect(top-N)")):
-            if DEBUG:
-                _log(f"[STEP {step}] moving batch to {MODEL_DEVICE}")
+            _log(f"[PASS1] Start | layers={layers} | k={k} | nl={nl}")
+        global_sample_base = 0
+        for step, batch in enumerate(tqdm(dl_test, desc="pass1-topN")):
             batch = batch.to(MODEL_DEVICE)
-            if DEBUG:
-                _print_mem(f"before forward step={step}")
-                _log(f"[STEP {step}] model forward start")
             _ = model(batch, use_cache=False)
-            if DEBUG:
-                _log(f"[STEP {step}] model forward done")
-                _print_mem(f"after forward step={step}")
-
-            # tokens for this batch samples will be computed lazily per sample
-            tokens_cache: Dict[int, List[str]] = {}
-
             for layer in layers:
                 hook = hooks_model[layer]
                 sae = saes[layer]
-                hook_sae = hooks_sae[layer]
-
                 out = hook.output
                 activation = out[0] if isinstance(out, tuple) else out
                 activation = activation[:, 1:, :]
-                bs, seq, d = activation.shape  # bs, seq, d
-                if DEBUG:
-                    _log(f"[STEP {step}] L{layer} activation shape={tuple(activation.shape)} d_in={d} num_latents={sae.num_latents}")
-
-                # Chunk over the batch dimension to reduce VRAM peak, similar to train.py
+                bs, seq, _ = activation.shape
                 inf_chunks = TrainConfig().inf_bs_expansion
                 b_start = 0
-                for ci, act_chunk in enumerate(torch.chunk(activation, inf_chunks, dim=0)):
+                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
                     sub_bs = act_chunk.shape[0]
                     flat = act_chunk.flatten(0, 1)
                     flat = normalize_activation(flat, nl).to(SAE_DEVICE)
-                    if DEBUG:
-                        _log(f"[STEP {step}] L{layer} chunk {ci}/{inf_chunks} SAE forward start sub_bs={sub_bs}")
-                        _print_mem(f"before SAE fwd step={step} L={layer} sub_bs={sub_bs}")
-                    try:
-                        out_sae = sae(flat)
-                    except Exception as e:
-                        _log(f"[ERR] SAE forward failed at step={step} L={layer} chunk={ci} err={e}")
-                        raise
+                    out_sae = sae(flat)
                     latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
                     latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
-                    # Accessing encoder output (dense). This may be heavy; log before and after.
-                    if DEBUG:
-                        _print_mem(f"after SAE fwd step={step} L={layer}")
-                        _log(f"[STEP {step}] L{layer} encoder hook read start")
-                    try:
-                        sae_activation = hook_sae.output.view(sub_bs, seq, -1)
-                    except Exception as e:
-                        _log(f"[ERR] encoder hook read failed at step={step} L={layer} chunk={ci} err={e}")
-                        raise
-                    if DEBUG:
-                        approx_bytes = sub_bs * seq * sae.num_latents * 2  # bf16 ~ 2 bytes
-                        _log(f"[STEP {step}] L{layer} sae_activation shape={tuple(sae_activation.shape)} ~{_bytes_to_str(approx_bytes)}")
-                        _print_mem(f"after encoder hook read step={step} L={layer}")
-
-                    # For each sample in this chunk, compute per-feature max activation (from sparse top-k)
                     for bb in range(sub_bs):
-                        b = b_start + bb  # global batch index within this DataLoader iteration
-                        # Build per-feature max score using sparse indices/acts
-                        flat_idx = latent_indices[bb].reshape(-1)
-                        flat_act = latent_acts[bb].reshape(-1)
+                        b = b_start + bb
+                        idx_list = latent_indices[bb].reshape(-1).tolist()
+                        act_list = latent_acts[bb].reshape(-1).tolist()
                         feat_max: Dict[int, float] = {}
-                        idx_list = flat_idx.tolist()
-                        act_list = flat_act.tolist()
                         for idx_i, act_i in zip(idx_list, act_list):
                             prev = feat_max.get(idx_i)
                             if prev is None or act_i > prev:
                                 feat_max[idx_i] = float(act_i)
-
                         if not feat_max:
                             continue
-
-                        # Evaluate heap thresholds and push candidates only when promising
+                        sample_idx = global_sample_base + b
                         for idx_i, score in feat_max.items():
                             heap = heaps_per_layer[layer][idx_i]
-                            if len(heap) >= top_n and score <= heap[0][0]:
-                                continue
-
-                            # Prepare tokens for this sample only once
-                            if b not in tokens_cache:
-                                tokens_cache[b] = [
-                                    w.replace("▁", " ")
-                                    for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
-                                ]
-                            tokens = tokens_cache[b]
-
-                            # Extract per-token activation values for this feature from the chunk SAE encoder output
-                            act_values = sae_activation[bb, :, idx_i].tolist()
-                            record = ActivationRecord(tokens=tokens, act_values=act_values)
-                            score_val = float(max(0.0, max(act_values)))
-                            counter += 1
-                            item = (score_val, counter, record)
-
+                            item = (score, sample_idx)
                             if len(heap) < top_n:
                                 heapq.heappush(heap, item)
                             else:
                                 if item[0] > heap[0][0]:
                                     heapq.heapreplace(heap, item)
                     b_start += sub_bs
-                if DEBUG:
-                    _log(f"[STEP {step}] L{layer} done")
-            if DEBUG:
-                _log(f"[STEP {step}] all layers done")
+            global_sample_base += bs
 
-    # Save per-layer features
+    # Build mapping for PASS 2
+    selected_per_layer: Dict[int, Dict[int, List[int]]] = {}
+    for layer in layers:
+        selected_per_layer[layer] = {}
+        for feat_id, heap in enumerate(heaps_per_layer[layer]):
+            if not heap:
+                continue
+            items_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
+            selected_per_layer[layer][feat_id] = [sidx for _, sidx in items_sorted]
+
+    sample_to_features: Dict[int, Dict[int, List[int]]] = {layer: {} for layer in layers}
+    for layer in layers:
+        for feat_id, sidx_list in selected_per_layer[layer].items():
+            for sidx in sidx_list:
+                sample_to_features[layer].setdefault(sidx, []).append(feat_id)
+
+    # Temp dirs for streaming writes
+    tmp_dirs: Dict[int, str] = {}
+    for layer in layers:
+        tmp_dir = os.path.join(save_dir, f"tmp_features_layer{layer}")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_dirs[layer] = tmp_dir
+
+    # PASS 2: reconstruct per-token activations only for selected samples/features; write tmp jsonl
+    with torch.inference_mode():
+        global_sample_base = 0
+        for step, batch in enumerate(tqdm(dl_test, desc="pass2-reconstruct")):
+            batch = batch.to(MODEL_DEVICE)
+            _ = model(batch, use_cache=False)
+            tokens_cache: Dict[int, List[str]] = {}
+            for layer in layers:
+                needed = sample_to_features[layer]
+                if not needed:
+                    continue
+                hook = hooks_model[layer]
+                sae = saes[layer]
+                out = hook.output
+                activation = out[0] if isinstance(out, tuple) else out
+                activation = activation[:, 1:, :]
+                bs, seq, _ = activation.shape
+                inf_chunks = TrainConfig().inf_bs_expansion
+                b_start = 0
+                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
+                    sub_bs = act_chunk.shape[0]
+                    flat = act_chunk.flatten(0, 1)
+                    flat = normalize_activation(flat, nl).to(SAE_DEVICE)
+                    out_sae = sae(flat)
+                    latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
+                    latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
+                    for bb in range(sub_bs):
+                        b = b_start + bb
+                        sample_idx = global_sample_base + b
+                        if sample_idx not in needed:
+                            continue
+                        feats = needed[sample_idx]
+                        if b not in tokens_cache:
+                            tokens_cache[b] = [
+                                w.replace("▁", " ")
+                                for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
+                            ]
+                        tokens = tokens_cache[b]
+                        idxs = latent_indices[bb]
+                        acts = latent_acts[bb]
+                        for fid in feats:
+                            mask = (idxs == fid)
+                            vals = torch.where(mask, acts, torch.zeros_like(acts)).max(dim=-1).values
+                            act_values = vals.tolist()
+                            score_val = float(max(0.0, max(act_values)))
+                            tmp_fp = os.path.join(tmp_dirs[layer], f"{fid}.jsonl")
+                            with open(tmp_fp, "a") as f:
+                                json.dump({
+                                    "score": score_val,
+                                    "tokens": tokens,
+                                    "act_values": act_values,
+                                }, f, ensure_ascii=False)
+                                f.write("\n")
+                    b_start += sub_bs
+            global_sample_base += bs
+
+    # Finalize: assemble per-feature JSONs and remove tmp
     for layer in layers:
         features_dir = os.path.join(save_dir, f"features_layer{layer}")
         os.makedirs(features_dir, exist_ok=True)
-        num_features = num_features_per_layer[layer]
-        heaps = heaps_per_layer[layer]
-
-        for feat_id in tqdm(range(num_features), desc=f"L{layer} save"):
-            heap = heaps[feat_id]
-            if not heap:
+        tmp_dir = tmp_dirs[layer]
+        for feat_id, sidx_list in selected_per_layer[layer].items():
+            tmp_fp = os.path.join(tmp_dir, f"{feat_id}.jsonl")
+            if not os.path.exists(tmp_fp):
                 continue
-            # Sort descending by score
-            items_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
-            fr = FeatureRecord(feature_id=feat_id)
-            for _, _, rec in items_sorted:
-                fr.act_patterns.append(rec)
-            save_token_act(fr, features_dir)
-        if DEBUG:
-            _log(f"[SAVE] L{layer} saved features to {features_dir}")
+            entries = []
+            with open(tmp_fp, "r") as f:
+                for line in f:
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        pass
+            if not entries:
+                continue
+            entries.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            max_act = 0.0
+            for e in entries:
+                if e["act_values"]:
+                    max_act = max(max_act, max(e["act_values"]))
+            token_act_list = []
+            for e in entries:
+                tokens = e["tokens"]
+                acts = e["act_values"]
+                token_act = []
+                if max_act <= 0:
+                    token_act = [[t, 0] for t in tokens]
+                else:
+                    for t, a in zip(tokens, acts):
+                        aa = 0 if a < 0 else math.ceil(a * 10 / max_act)
+                        token_act.append([t, aa])
+                token_act_list.append(token_act)
+            with open(os.path.join(features_dir, f"{feat_id}.json"), "w") as f:
+                json.dump({"token_act": token_act_list}, f, ensure_ascii=False, indent=4)
+            try:
+                os.remove(tmp_fp)
+            except Exception:
+                pass
 
 
 def _format_activation_record(activation_record, max_act):

@@ -77,7 +77,8 @@ def collect_feature_pattern(
         heaps_per_layer[layer] = [[] for _ in range(sae.num_latents)]
 
     # Single pass over the dataset; each batch computed once for all layers
-    with torch.no_grad():
+    # Use inference_mode to minimize gradient-related buffers
+    with torch.inference_mode():
         for step, batch in enumerate(tqdm(dl_test, desc="collect(top-N)")):
             batch = batch.to(MODEL_DEVICE)
             _ = model(batch, use_cache=False)
@@ -93,62 +94,65 @@ def collect_feature_pattern(
                 out = hook.output
                 activation = out[0] if isinstance(out, tuple) else out
                 activation = activation[:, 1:, :]
-                shape = activation.shape  # bs, seq, d
-                activation = activation.flatten(0, 1)
-                activation = normalize_activation(activation, nl).to(SAE_DEVICE)
+                bs, seq, d = activation.shape  # bs, seq, d
 
-                out_sae = sae(activation)
-                latent_indices = out_sae.latent_indices.view(shape[0], shape[1], k)
-                latent_acts = out_sae.latent_acts.view(shape[0], shape[1], k)
-                sae_activation = hook_sae.output.view(shape[0], shape[1], -1)
+                # Chunk over the batch dimension to reduce VRAM peak, similar to train.py
+                inf_chunks = TrainConfig().inf_bs_expansion
+                b_start = 0
+                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
+                    sub_bs = act_chunk.shape[0]
+                    flat = act_chunk.flatten(0, 1)
+                    flat = normalize_activation(flat, nl).to(SAE_DEVICE)
 
-                # For each sample in batch, compute per-feature max activation (from sparse top-k)
-                for b in range(shape[0]):
-                    # Build per-feature max score using sparse indices/acts
-                    flat_idx = latent_indices[b].reshape(-1)
-                    flat_act = latent_acts[b].reshape(-1)
-                    # Accumulate maxima in a python dict to avoid giant dense ops
-                    feat_max: Dict[int, float] = {}
-                    idx_list = flat_idx.tolist()
-                    act_list = flat_act.tolist()
-                    for idx_i, act_i in zip(idx_list, act_list):
-                        # act_i is a python float already if dtype is fp16/bf16; ensure float
-                        prev = feat_max.get(idx_i)
-                        if prev is None or act_i > prev:
-                            feat_max[idx_i] = float(act_i)
+                    out_sae = sae(flat)
+                    latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
+                    latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
+                    sae_activation = hook_sae.output.view(sub_bs, seq, -1)
 
-                    if not feat_max:
-                        continue
+                    # For each sample in this chunk, compute per-feature max activation (from sparse top-k)
+                    for bb in range(sub_bs):
+                        b = b_start + bb  # global batch index within this DataLoader iteration
+                        # Build per-feature max score using sparse indices/acts
+                        flat_idx = latent_indices[bb].reshape(-1)
+                        flat_act = latent_acts[bb].reshape(-1)
+                        feat_max: Dict[int, float] = {}
+                        idx_list = flat_idx.tolist()
+                        act_list = flat_act.tolist()
+                        for idx_i, act_i in zip(idx_list, act_list):
+                            prev = feat_max.get(idx_i)
+                            if prev is None or act_i > prev:
+                                feat_max[idx_i] = float(act_i)
 
-                    # Compute tokens lazily only if we are going to insert something
-                    # We don't know yet, so we prepare a quick reference to heaps to compare
-                    # We'll compute tokens only when pushing
-                    for idx_i, score in feat_max.items():
-                        heap = heaps_per_layer[layer][idx_i]
-                        # Quick skip if heap is full and score is not better than current min
-                        if len(heap) >= top_n and score <= heap[0][0]:
+                        if not feat_max:
                             continue
 
-                        # Prepare tokens for this sample only once
-                        if b not in tokens_cache:
-                            tokens_cache[b] = [
-                                w.replace("▁", " ")
-                                for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
-                            ]
-                        tokens = tokens_cache[b]
-                        # Extract per-token activation values for this feature from SAE encoder output
-                        act_values = sae_activation[b, :, idx_i].tolist()
-                        record = ActivationRecord(tokens=tokens, act_values=act_values)
+                        # Evaluate heap thresholds and push candidates only when promising
+                        for idx_i, score in feat_max.items():
+                            heap = heaps_per_layer[layer][idx_i]
+                            if len(heap) >= top_n and score <= heap[0][0]:
+                                continue
 
-                        counter += 1
-                        item = (float(max(0.0, max(act_values))), counter, record)
+                            # Prepare tokens for this sample only once
+                            if b not in tokens_cache:
+                                tokens_cache[b] = [
+                                    w.replace("▁", " ")
+                                    for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
+                                ]
+                            tokens = tokens_cache[b]
 
-                        if len(heap) < top_n:
-                            heapq.heappush(heap, item)
-                        else:
-                            # Replace smallest if current is larger
-                            if item[0] > heap[0][0]:
-                                heapq.heapreplace(heap, item)
+                            # Extract per-token activation values for this feature from the chunk SAE encoder output
+                            act_values = sae_activation[bb, :, idx_i].tolist()
+                            record = ActivationRecord(tokens=tokens, act_values=act_values)
+                            score_val = float(max(0.0, max(act_values)))
+                            counter += 1
+                            item = (score_val, counter, record)
+
+                            if len(heap) < top_n:
+                                heapq.heappush(heap, item)
+                            else:
+                                if item[0] > heap[0][0]:
+                                    heapq.heapreplace(heap, item)
+                    b_start += sub_bs
 
     # Save per-layer features
     for layer in layers:

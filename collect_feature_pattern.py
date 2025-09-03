@@ -81,6 +81,13 @@ else:
     SAE_DEVICE = torch.device("cpu")
 
 
+# Optional fast JSON
+try:
+    import orjson as _orjson  # type: ignore
+    _HAS_ORJSON = True
+except Exception:
+    _HAS_ORJSON = False
+
 # --- Binary intermediate record helpers ---
 def _bin_append_record(path: str, obj: dict):
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -128,6 +135,7 @@ def collect_feature_pattern_impl(
     finalize_workers: int = None,
     verify_resonstruct: bool = False,
     no_skip: bool = False,
+    final_format: str = "pairs",
 ):
     # Load model and tokenizer once
     if DEBUG:
@@ -400,7 +408,7 @@ def collect_feature_pattern_impl(
 
     # Finalize: assemble per-feature JSONs and remove tmp, in parallel
     def _finalize_one(args):
-        layer, feat_id, tmp_dir, features_dir = args
+        layer, feat_id, tmp_dir, features_dir, fmt = args
         tmp_fp = os.path.join(tmp_dir, f"{feat_id}.bin")
         out_fp = os.path.join(features_dir, f"{feat_id}.json")
         if not os.path.exists(tmp_fp):
@@ -413,7 +421,11 @@ def collect_feature_pattern_impl(
                 except Exception:
                     pass
                 return (feat_id, True)
-            entries.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            # Sort by score desc to ensure deterministic top-N order
+            try:
+                entries.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            except Exception:
+                pass
             max_act = 0.0
             for e in entries:
                 acts = e.get("act_values", [])
@@ -421,20 +433,41 @@ def collect_feature_pattern_impl(
                     m = max(acts)
                     if m > max_act:
                         max_act = m
-            token_act_list = []
-            for e in entries:
-                tokens = e.get("tokens", [])
-                acts = e.get("act_values", [])
-                if max_act <= 0:
-                    token_act = [[t, 0] for t in tokens]
-                else:
-                    token_act = []
-                    for t, a in zip(tokens, acts):
-                        aa = 0 if a < 0 else math.ceil(a * 10 / max_act)
-                        token_act.append([t, aa])
-                token_act_list.append(token_act)
-            with open(out_fp, "w") as f:
-                json.dump({"token_act": token_act_list}, f, ensure_ascii=False, separators=(',', ':'))
+
+            if fmt == "pairs":
+                token_act_list = []
+                for e in entries:
+                    tokens = e.get("tokens", [])
+                    acts = e.get("act_values", [])
+                    if max_act <= 0:
+                        token_act = [[t, 0] for t in tokens]
+                    else:
+                        token_act = []
+                        for t, a in zip(tokens, acts):
+                            aa = 0 if a < 0 else math.ceil(a * 10 / max_act)
+                            token_act.append([t, aa])
+                    token_act_list.append(token_act)
+                obj = {"token_act": token_act_list}
+            else:  # compact
+                tokens_2d: List[List[str]] = []
+                acts_2d: List[List[int]] = []
+                for e in entries:
+                    tokens = e.get("tokens", [])
+                    acts = e.get("act_values", [])
+                    tokens_2d.append(tokens)
+                    if max_act <= 0:
+                        acts_i = [0 for _ in tokens]
+                    else:
+                        acts_i = [0 if (a is None or a < 0) else int(math.ceil(a * 10 / max_act)) for a in acts]
+                    acts_2d.append(acts_i)
+                obj = {"tokens": tokens_2d, "acts": acts_2d}
+
+            if _HAS_ORJSON:
+                with open(out_fp, "wb") as f:
+                    f.write(_orjson.dumps(obj, option=0))
+            else:
+                with open(out_fp, "w") as f:
+                    json.dump(obj, f, ensure_ascii=False, separators=(',', ':'))
             try:
                 os.remove(tmp_fp)
             except Exception:
@@ -465,7 +498,7 @@ def collect_feature_pattern_impl(
                 fid for fid in selected_per_layer.get(layer, {}).keys()
                 if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin")) and not os.path.exists(os.path.join(features_dir, f"{fid}.json"))
             ]
-        tasks = [(layer, fid, tmp_dir, features_dir) for fid in feat_ids]
+        tasks = [(layer, fid, tmp_dir, features_dir, final_format) for fid in feat_ids]
         total = len(tasks)
         if total == 0:
             _log(f"[FINALIZE] L{layer} no pending features")
@@ -516,8 +549,14 @@ def save_token_act(
         max_act,
     )
 
-    with open(os.path.join(features_dir, f"{feature_record.feature_id}.json"), "w") as f:
-        json.dump({"token_act": token_act_list}, f, ensure_ascii=False, separators=(',', ':'))
+    out_fp = os.path.join(features_dir, f"{feature_record.feature_id}.json")
+    obj = {"token_act": token_act_list}
+    if _HAS_ORJSON:
+        with open(out_fp, "wb") as f:
+            f.write(_orjson.dumps(obj, option=0))
+    else:
+        with open(out_fp, "w") as f:
+            json.dump(obj, f, ensure_ascii=False, separators=(',', ':'))
 
 
 def main():
@@ -540,6 +579,7 @@ def main():
     parser.add_argument("--top_n", type=int, default=None, help="Top-N examples per feature (overrides thresholding)")
     parser.add_argument("--debug_mem", action="store_true", help="Enable verbose memory and shape logging for debugging")
     parser.add_argument("--verify_resonstruct", action="store_true", help="Verify O(seq×k) reconstruction against mask-based method on a small subset")
+    parser.add_argument("--final_format", type=str, default="pairs", choices=["pairs","compact"], help="Final JSON schema: 'pairs' ([[token,int],...]) or 'compact' ({tokens,acts})")
     parser.add_argument("--finalize_workers", type=int, default=None, help="Parallel workers for finalize (CPU). Default=min(8, CPU cores)")
     parser.add_argument("--no_skip", action="store_true", help="Disable resume/skip logic and recompute all stages")
     parser.add_argument(
@@ -595,6 +635,7 @@ def main():
         args.finalize_workers,
         args.verify_resonstruct,
         args.no_skip,
+        args.final_format,
     )
 
 

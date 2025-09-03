@@ -127,6 +127,7 @@ def collect_feature_pattern_impl(
     DEBUG: bool,
     finalize_workers: int = None,
     verify_resonstruct: bool = False,
+    no_skip: bool = False,
 ):
     # Load model and tokenizer once
     if DEBUG:
@@ -163,7 +164,7 @@ def collect_feature_pattern_impl(
     for layer in layers:
         # Check existing pass1 selection
         p1p = _pass1_path(layer)
-        if os.path.exists(p1p):
+        if (not no_skip) and os.path.exists(p1p):
             try:
                 with open(p1p, 'r') as f:
                     data = json.load(f)
@@ -201,6 +202,10 @@ def collect_feature_pattern_impl(
             heaps_per_layer[layer] = [[] for _ in range(sae.num_latents)]
 
     # PASS 1: compute top-N sample indices per feature using only sparse outputs
+    if no_skip:
+        # Force recompute pass1 for all given layers
+        pass1_layers = list(layers)
+
     if pass1_layers:
         with torch.inference_mode():
             if DEBUG:
@@ -272,12 +277,20 @@ def collect_feature_pattern_impl(
         for feat_id, sidx_list in feats_map.items():
             final_json = os.path.join(features_dir, f"{feat_id}.json")
             tmp_bin = os.path.join(tmp_dir, f"{feat_id}.bin")
-            # If final already exists, skip entirely (both pass2 and finalize)
-            if os.path.exists(final_json):
-                continue
-            # If tmp already exists, skip pass2 for this feature
-            if os.path.exists(tmp_bin):
-                continue
+            if not no_skip:
+                # If final already exists, skip entirely (both pass2 and finalize)
+                if os.path.exists(final_json):
+                    continue
+                # If tmp already exists, skip pass2 for this feature
+                if os.path.exists(tmp_bin):
+                    continue
+            else:
+                # Force recompute: remove any existing tmp to avoid duplication
+                if os.path.exists(tmp_bin):
+                    try:
+                        os.remove(tmp_bin)
+                    except Exception:
+                        pass
             for sidx in sidx_list:
                 sample_to_features[layer].setdefault(sidx, []).append(feat_id)
 
@@ -421,7 +434,7 @@ def collect_feature_pattern_impl(
                         token_act.append([t, aa])
                 token_act_list.append(token_act)
             with open(out_fp, "w") as f:
-                json.dump({"token_act": token_act_list}, f, ensure_ascii=False, indent=4)
+                json.dump({"token_act": token_act_list}, f, ensure_ascii=False, separators=(',', ':'))
             try:
                 os.remove(tmp_fp)
             except Exception:
@@ -442,10 +455,16 @@ def collect_feature_pattern_impl(
         features_dir = os.path.join(save_dir, f"features_layer{layer}")
         os.makedirs(features_dir, exist_ok=True)
         tmp_dir = tmp_dirs[layer]
-        feat_ids = [
-            fid for fid in selected_per_layer.get(layer, {}).keys()
-            if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin")) and not os.path.exists(os.path.join(features_dir, f"{fid}.json"))
-        ]
+        if no_skip:
+            feat_ids = [
+                fid for fid in selected_per_layer.get(layer, {}).keys()
+                if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin"))
+            ]
+        else:
+            feat_ids = [
+                fid for fid in selected_per_layer.get(layer, {}).keys()
+                if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin")) and not os.path.exists(os.path.join(features_dir, f"{fid}.json"))
+            ]
         tasks = [(layer, fid, tmp_dir, features_dir) for fid in feat_ids]
         total = len(tasks)
         if total == 0:
@@ -497,17 +516,8 @@ def save_token_act(
         max_act,
     )
 
-    with open(
-        os.path.join(features_dir, f"{feature_record.feature_id}.json"), "w"
-    ) as f:
-        json.dump(
-            {
-                "token_act": token_act_list,
-            },
-            f,
-            ensure_ascii=False,
-            indent=4,
-        )
+    with open(os.path.join(features_dir, f"{feature_record.feature_id}.json"), "w") as f:
+        json.dump({"token_act": token_act_list}, f, ensure_ascii=False, separators=(',', ':'))
 
 
 def main():
@@ -531,6 +541,7 @@ def main():
     parser.add_argument("--debug_mem", action="store_true", help="Enable verbose memory and shape logging for debugging")
     parser.add_argument("--verify_resonstruct", action="store_true", help="Verify O(seq×k) reconstruction against mask-based method on a small subset")
     parser.add_argument("--finalize_workers", type=int, default=None, help="Parallel workers for finalize (CPU). Default=min(8, CPU cores)")
+    parser.add_argument("--no_skip", action="store_true", help="Disable resume/skip logic and recompute all stages")
     parser.add_argument(
         "--model_name_or_dir",
         type=str,
@@ -583,6 +594,7 @@ def main():
         args.debug_mem,
         args.finalize_workers,
         args.verify_resonstruct,
+        args.no_skip,
     )
 
 

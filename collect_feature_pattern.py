@@ -4,6 +4,8 @@ import math
 import os
 
 import torch
+import concurrent.futures as _futures
+import os as _os
 from config import EvalConfig, SaeConfig, TrainConfig, UsrConfig, return_save_dir
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -13,6 +15,8 @@ from dataset import ActivationRecord, CustomWikiDataset, FeatureRecord
 import heapq
 from typing import Dict, List, Tuple, Optional
 import time
+import pickle
+import numpy as np
 
 def _read_proc_rss_kb() -> Optional[int]:
     try:
@@ -77,6 +81,38 @@ else:
     SAE_DEVICE = torch.device("cpu")
 
 
+# --- Binary intermediate record helpers ---
+def _bin_append_record(path: str, obj: dict):
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    # Write length-prefixed record to allow streaming append
+    with open(path, "ab") as f:
+        f.write(len(data).to_bytes(8, "little"))
+        f.write(data)
+
+
+def _bin_iter_records(path: str):
+    with open(path, "rb") as f:
+        while True:
+            hdr = f.read(8)
+            if not hdr or len(hdr) < 8:
+                break
+            n = int.from_bytes(hdr, "little")
+            buf = f.read(n)
+            if not buf or len(buf) < n:
+                break
+            yield pickle.loads(buf)
+
+
+def _bin_append_many(path: str, objs: List[dict]):
+    if not objs:
+        return
+    with open(path, "ab") as f:
+        for obj in objs:
+            data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+            f.write(len(data).to_bytes(8, "little"))
+            f.write(data)
+
+
 def collect_feature_pattern_impl(
     dl_test,
     model_name_or_dir,
@@ -89,6 +125,8 @@ def collect_feature_pattern_impl(
     save_dir,
     top_n,
     DEBUG: bool,
+    finalize_workers: int = None,
+    verify_resonstruct: bool = False,
 ):
     # Load model and tokenizer once
     if DEBUG:
@@ -117,6 +155,25 @@ def collect_feature_pattern_impl(
     # For each layer, maintain a list of min-heaps per feature id
     # Each heap stores tuples: (score, counter, ActivationRecord)
     heaps_per_layer: Dict[int, List[List[Tuple[float, int, ActivationRecord]]]] = {}
+    # Pass1 resume support
+    def _pass1_path(layer: int) -> str:
+        return os.path.join(save_dir, f"pass1_selected_layer{layer}.json")
+    selected_per_layer: Dict[int, Dict[int, List[int]]] = {}
+    pass1_layers: List[int] = []
+    for layer in layers:
+        # Check existing pass1 selection
+        p1p = _pass1_path(layer)
+        if os.path.exists(p1p):
+            try:
+                with open(p1p, 'r') as f:
+                    data = json.load(f)
+                # keys as int
+                selected_per_layer[layer] = {int(k): v for k, v in data.items()}
+            except Exception:
+                selected_per_layer[layer] = {}
+                pass1_layers.append(layer)
+        else:
+            pass1_layers.append(layer)
     counter = 0  # global tie-breaker
 
     for layer in layers:
@@ -139,69 +196,88 @@ def collect_feature_pattern_impl(
         target = model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
         hooks_model[layer] = SimpleHook(target)
 
-        # Init heaps per feature
-        heaps_per_layer[layer] = [[] for _ in range(sae.num_latents)]
+        # Init heaps per feature only if we will run pass1 for this layer
+        if layer in pass1_layers:
+            heaps_per_layer[layer] = [[] for _ in range(sae.num_latents)]
 
     # PASS 1: compute top-N sample indices per feature using only sparse outputs
-    with torch.inference_mode():
-        if DEBUG:
-            _log(f"[PASS1] Start | layers={layers} | k={k} | nl={nl}")
-        global_sample_base = 0
-        for step, batch in enumerate(tqdm(dl_test, desc="pass1-topN")):
-            batch = batch.to(MODEL_DEVICE)
-            _ = model(batch, use_cache=False)
-            for layer in layers:
-                hook = hooks_model[layer]
-                sae = saes[layer]
-                out = hook.output
-                activation = out[0] if isinstance(out, tuple) else out
-                activation = activation[:, 1:, :]
-                bs, seq, _ = activation.shape
-                inf_chunks = TrainConfig().inf_bs_expansion
-                b_start = 0
-                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
-                    sub_bs = act_chunk.shape[0]
-                    flat = act_chunk.flatten(0, 1)
-                    flat = normalize_activation(flat, nl).to(SAE_DEVICE)
-                    out_sae = sae(flat)
-                    latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
-                    latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
-                    for bb in range(sub_bs):
-                        b = b_start + bb
-                        idx_list = latent_indices[bb].reshape(-1).tolist()
-                        act_list = latent_acts[bb].reshape(-1).tolist()
-                        feat_max: Dict[int, float] = {}
-                        for idx_i, act_i in zip(idx_list, act_list):
-                            prev = feat_max.get(idx_i)
-                            if prev is None or act_i > prev:
-                                feat_max[idx_i] = float(act_i)
-                        if not feat_max:
-                            continue
-                        sample_idx = global_sample_base + b
-                        for idx_i, score in feat_max.items():
-                            heap = heaps_per_layer[layer][idx_i]
-                            item = (score, sample_idx)
-                            if len(heap) < top_n:
-                                heapq.heappush(heap, item)
-                            else:
-                                if item[0] > heap[0][0]:
-                                    heapq.heapreplace(heap, item)
-                    b_start += sub_bs
-            global_sample_base += bs
-
-    # Build mapping for PASS 2
-    selected_per_layer: Dict[int, Dict[int, List[int]]] = {}
-    for layer in layers:
-        selected_per_layer[layer] = {}
-        for feat_id, heap in enumerate(heaps_per_layer[layer]):
-            if not heap:
-                continue
-            items_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
-            selected_per_layer[layer][feat_id] = [sidx for _, sidx in items_sorted]
+    if pass1_layers:
+        with torch.inference_mode():
+            if DEBUG:
+                _log(f"[PASS1] Start | layers={pass1_layers} | k={k} | nl={nl}")
+            global_sample_base = 0
+            for step, batch in enumerate(tqdm(dl_test, desc="pass1-topN")):
+                batch = batch.to(MODEL_DEVICE)
+                _ = model(batch, use_cache=False)
+                for layer in pass1_layers:
+                    hook = hooks_model[layer]
+                    sae = saes[layer]
+                    out = hook.output
+                    activation = out[0] if isinstance(out, tuple) else out
+                    activation = activation[:, 1:, :]
+                    bs, seq, _ = activation.shape
+                    inf_chunks = TrainConfig().inf_bs_expansion
+                    b_start = 0
+                    for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
+                        sub_bs = act_chunk.shape[0]
+                        flat = act_chunk.flatten(0, 1)
+                        flat = normalize_activation(flat, nl).to(SAE_DEVICE)
+                        out_sae = sae(flat)
+                        latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
+                        latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
+                        for bb in range(sub_bs):
+                            b = b_start + bb
+                            idx_list = latent_indices[bb].reshape(-1).tolist()
+                            act_list = latent_acts[bb].reshape(-1).tolist()
+                            feat_max: Dict[int, float] = {}
+                            for idx_i, act_i in zip(idx_list, act_list):
+                                prev = feat_max.get(idx_i)
+                                if prev is None or act_i > prev:
+                                    feat_max[idx_i] = float(act_i)
+                            if not feat_max:
+                                continue
+                            sample_idx = global_sample_base + b
+                            for idx_i, score in feat_max.items():
+                                heap = heaps_per_layer[layer][idx_i]
+                                item = (score, sample_idx)
+                                if len(heap) < top_n:
+                                    heapq.heappush(heap, item)
+                                else:
+                                    if item[0] > heap[0][0]:
+                                        heapq.heapreplace(heap, item)
+                        b_start += sub_bs
+                global_sample_base += bs
+        # Save pass1 selections for processed layers
+        for layer in pass1_layers:
+            sel: Dict[int, List[int]] = {}
+            for feat_id, heap in enumerate(heaps_per_layer[layer]):
+                if not heap:
+                    continue
+                items_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
+                sel[feat_id] = [sidx for _, sidx in items_sorted]
+            selected_per_layer[layer] = sel
+            try:
+                with open(_pass1_path(layer), 'w') as f:
+                    json.dump({str(k): v for k, v in sel.items()}, f)
+            except Exception:
+                pass
 
     sample_to_features: Dict[int, Dict[int, List[int]]] = {layer: {} for layer in layers}
     for layer in layers:
-        for feat_id, sidx_list in selected_per_layer[layer].items():
+        feats_map = selected_per_layer.get(layer, {})
+        features_dir = os.path.join(save_dir, f"features_layer{layer}")
+        os.makedirs(features_dir, exist_ok=True)
+        tmp_dir = os.path.join(save_dir, f"tmp_features_layer{layer}")
+        os.makedirs(tmp_dir, exist_ok=True)
+        for feat_id, sidx_list in feats_map.items():
+            final_json = os.path.join(features_dir, f"{feat_id}.json")
+            tmp_bin = os.path.join(tmp_dir, f"{feat_id}.bin")
+            # If final already exists, skip entirely (both pass2 and finalize)
+            if os.path.exists(final_json):
+                continue
+            # If tmp already exists, skip pass2 for this feature
+            if os.path.exists(tmp_bin):
+                continue
             for sidx in sidx_list:
                 sample_to_features[layer].setdefault(sidx, []).append(feat_id)
 
@@ -213,16 +289,19 @@ def collect_feature_pattern_impl(
         tmp_dirs[layer] = tmp_dir
 
     # PASS 2: reconstruct per-token activations only for selected samples/features; write tmp jsonl
-    with torch.inference_mode():
-        global_sample_base = 0
-        for step, batch in enumerate(tqdm(dl_test, desc="pass2-reconstruct")):
-            batch = batch.to(MODEL_DEVICE)
-            _ = model(batch, use_cache=False)
-            tokens_cache: Dict[int, List[str]] = {}
-            for layer in layers:
-                needed = sample_to_features[layer]
-                if not needed:
-                    continue
+    # Skip pass2 entirely if nothing to reconstruct
+    any_needed = any(len(d) > 0 for d in sample_to_features.values())
+    if any_needed:
+        with torch.inference_mode():
+            global_sample_base = 0
+            for step, batch in enumerate(tqdm(dl_test, desc="pass2-reconstruct")):
+                batch = batch.to(MODEL_DEVICE)
+                _ = model(batch, use_cache=False)
+                tokens_cache: Dict[int, List[str]] = {}
+                for layer in layers:
+                    needed = sample_to_features[layer]
+                    if not needed:
+                        continue
                 hook = hooks_model[layer]
                 sae = saes[layer]
                 out = hook.output
@@ -231,6 +310,8 @@ def collect_feature_pattern_impl(
                 bs, seq, _ = activation.shape
                 inf_chunks = TrainConfig().inf_bs_expansion
                 b_start = 0
+                # buffer for this batch/layer: fid -> list of records
+                layer_buffer: Dict[int, List[dict]] = {}
                 for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
                     sub_bs = act_chunk.shape[0]
                     flat = act_chunk.flatten(0, 1)
@@ -250,65 +331,132 @@ def collect_feature_pattern_impl(
                                 for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
                             ]
                         tokens = tokens_cache[b]
-                        idxs = latent_indices[bb]
-                        acts = latent_acts[bb]
+                        # O(seq×k) reconstruction: single pass over indices/acts to build per-fid per-token max
+                        idxs_np = latent_indices[bb].detach().to('cpu').numpy()
+                        acts_np = latent_acts[bb].detach().to('cpu').to(dtype=torch.float32).numpy()
+                        feats_set = set(feats)
+                        acc: Dict[int, Dict[int, float]] = {}
+                        for t in range(seq):
+                            idx_row = idxs_np[t]
+                            act_row = acts_np[t]
+                            for j in range(k):
+                                fid = int(idx_row[j])
+                                if fid in feats_set:
+                                    v = float(act_row[j])
+                                    d = acc.get(fid)
+                                    if d is None:
+                                        d = {}
+                                        acc[fid] = d
+                                    prev = d.get(t)
+                                    if prev is None or v > prev:
+                                        d[t] = v
+
+                        # Optional verification against mask-based method for first few features
+                        if verify_resonstruct:
+                            for fid in feats[:min(5, len(feats))]:
+                                vals = torch.where((latent_indices[bb] == fid), latent_acts[bb], torch.zeros_like(latent_acts[bb])).max(dim=-1).values
+                                old_list = vals.detach().to('cpu').tolist()
+                                d = acc.get(fid, {})
+                                new_list = [0.0]*seq
+                                for pos, val in d.items():
+                                    new_list[pos] = val
+                                if any(abs(a-b) > 1e-6 for a,b in zip(old_list, new_list)):
+                                    raise AssertionError(f"Reconstruct mismatch at layer {layer} sample {sample_idx} fid {fid}")
+
+                        # Write records per fid
                         for fid in feats:
-                            mask = (idxs == fid)
-                            vals = torch.where(mask, acts, torch.zeros_like(acts)).max(dim=-1).values
-                            act_values = vals.tolist()
-                            score_val = float(max(0.0, max(act_values)))
-                            tmp_fp = os.path.join(tmp_dirs[layer], f"{fid}.jsonl")
-                            with open(tmp_fp, "a") as f:
-                                json.dump({
-                                    "score": score_val,
-                                    "tokens": tokens,
-                                    "act_values": act_values,
-                                }, f, ensure_ascii=False)
-                                f.write("\n")
+                            d = acc.get(fid, {})
+                            act_values = [0.0]*seq
+                            if d:
+                                for pos, val in d.items():
+                                    act_values[pos] = val
+                            score_val = float(max(0.0, max(act_values) if act_values else 0.0))
+                            layer_buffer.setdefault(fid, []).append({
+                                "score": score_val,
+                                "tokens": tokens,
+                                "act_values": act_values,
+                            })
                     b_start += sub_bs
+                # flush buffer for this layer once per batch
+                if layer_buffer:
+                    tmp_dir = tmp_dirs[layer]
+                    for fid, records in layer_buffer.items():
+                        tmp_fp = os.path.join(tmp_dir, f"{fid}.bin")
+                        _bin_append_many(tmp_fp, records)
             global_sample_base += bs
 
-    # Finalize: assemble per-feature JSONs and remove tmp
-    for layer in layers:
-        features_dir = os.path.join(save_dir, f"features_layer{layer}")
-        os.makedirs(features_dir, exist_ok=True)
-        tmp_dir = tmp_dirs[layer]
-        for feat_id, sidx_list in selected_per_layer[layer].items():
-            tmp_fp = os.path.join(tmp_dir, f"{feat_id}.jsonl")
-            if not os.path.exists(tmp_fp):
-                continue
-            entries = []
-            with open(tmp_fp, "r") as f:
-                for line in f:
-                    try:
-                        entries.append(json.loads(line))
-                    except Exception:
-                        pass
+    # Finalize: assemble per-feature JSONs and remove tmp, in parallel
+    def _finalize_one(args):
+        layer, feat_id, tmp_dir, features_dir = args
+        tmp_fp = os.path.join(tmp_dir, f"{feat_id}.bin")
+        out_fp = os.path.join(features_dir, f"{feat_id}.json")
+        if not os.path.exists(tmp_fp):
+            return (feat_id, False)
+        try:
+            entries = list(_bin_iter_records(tmp_fp))
             if not entries:
-                continue
+                try:
+                    os.remove(tmp_fp)
+                except Exception:
+                    pass
+                return (feat_id, True)
             entries.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             max_act = 0.0
             for e in entries:
-                if e["act_values"]:
-                    max_act = max(max_act, max(e["act_values"]))
+                acts = e.get("act_values", [])
+                if acts:
+                    m = max(acts)
+                    if m > max_act:
+                        max_act = m
             token_act_list = []
             for e in entries:
-                tokens = e["tokens"]
-                acts = e["act_values"]
-                token_act = []
+                tokens = e.get("tokens", [])
+                acts = e.get("act_values", [])
                 if max_act <= 0:
                     token_act = [[t, 0] for t in tokens]
                 else:
+                    token_act = []
                     for t, a in zip(tokens, acts):
                         aa = 0 if a < 0 else math.ceil(a * 10 / max_act)
                         token_act.append([t, aa])
                 token_act_list.append(token_act)
-            with open(os.path.join(features_dir, f"{feat_id}.json"), "w") as f:
+            with open(out_fp, "w") as f:
                 json.dump({"token_act": token_act_list}, f, ensure_ascii=False, indent=4)
             try:
                 os.remove(tmp_fp)
             except Exception:
                 pass
+            return (feat_id, True)
+        except Exception:
+            return (feat_id, False)
+
+    # Determine workers
+    if finalize_workers is None or finalize_workers <= 0:
+        try:
+            cpu_cnt = os.cpu_count() or 4
+        except Exception:
+            cpu_cnt = 4
+        finalize_workers = min(8, cpu_cnt)
+
+    for layer in layers:
+        features_dir = os.path.join(save_dir, f"features_layer{layer}")
+        os.makedirs(features_dir, exist_ok=True)
+        tmp_dir = tmp_dirs[layer]
+        feat_ids = [
+            fid for fid in selected_per_layer.get(layer, {}).keys()
+            if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin")) and not os.path.exists(os.path.join(features_dir, f"{fid}.json"))
+        ]
+        tasks = [(layer, fid, tmp_dir, features_dir) for fid in feat_ids]
+        total = len(tasks)
+        if total == 0:
+            _log(f"[FINALIZE] L{layer} no pending features")
+            continue
+        desc = f"finalize L{layer}"
+        _log(f"[FINALIZE] L{layer} start | features={total} | workers={finalize_workers}")
+        # ThreadPool for safer behavior in CUDA-loaded process; mostly I/O bound here
+        with _futures.ThreadPoolExecutor(max_workers=finalize_workers) as ex:
+            results = list(tqdm(ex.map(_finalize_one, tasks, chunksize=16), total=total, desc=desc))
+        _log(f"[FINALIZE] L{layer} done")
 
 
 def _format_activation_record(activation_record, max_act):
@@ -381,6 +529,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--top_n", type=int, default=None, help="Top-N examples per feature (overrides thresholding)")
     parser.add_argument("--debug_mem", action="store_true", help="Enable verbose memory and shape logging for debugging")
+    parser.add_argument("--verify_resonstruct", action="store_true", help="Verify O(seq×k) reconstruction against mask-based method on a small subset")
+    parser.add_argument("--finalize_workers", type=int, default=None, help="Parallel workers for finalize (CPU). Default=min(8, CPU cores)")
     parser.add_argument(
         "--model_name_or_dir",
         type=str,
@@ -431,6 +581,8 @@ def main():
         save_dir,
         top_n,
         args.debug_mem,
+        args.finalize_workers,
+        args.verify_resonstruct,
     )
 
 

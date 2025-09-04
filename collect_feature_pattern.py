@@ -86,7 +86,7 @@ try:
     import orjson as _orjson  # type: ignore
     _HAS_ORJSON = True
 except Exception:
-    _HAS_ORJSON = False
+_HAS_ORJSON = False
 
 # --- Binary intermediate record helpers ---
 def _bin_append_record(path: str, obj: dict):
@@ -118,6 +118,75 @@ def _bin_append_many(path: str, objs: List[dict]):
             data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             f.write(len(data).to_bytes(8, "little"))
             f.write(data)
+
+
+def _finalize_one_task(args):
+    layer, feat_id, tmp_dir, features_dir, fmt = args
+    tmp_fp = os.path.join(tmp_dir, f"{feat_id}.bin")
+    out_fp = os.path.join(features_dir, f"{feat_id}.json")
+    if not os.path.exists(tmp_fp):
+        return (feat_id, False)
+    try:
+        entries = list(_bin_iter_records(tmp_fp))
+        if not entries:
+            try:
+                os.remove(tmp_fp)
+            except Exception:
+                pass
+            return (feat_id, True)
+        try:
+            entries.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        except Exception:
+            pass
+        max_act = 0.0
+        for e in entries:
+            acts = e.get("act_values", [])
+            if acts:
+                m = max(acts)
+                if m > max_act:
+                    max_act = m
+
+        if fmt == "pairs":
+            token_act_list = []
+            for e in entries:
+                tokens = e.get("tokens", [])
+                acts = e.get("act_values", [])
+                if max_act <= 0:
+                    token_act = [[t, 0] for t in tokens]
+                else:
+                    token_act = []
+                    for t, a in zip(tokens, acts):
+                        aa = 0 if a < 0 else math.ceil(a * 10 / max_act)
+                        token_act.append([t, aa])
+                token_act_list.append(token_act)
+            obj = {"token_act": token_act_list}
+        else:
+            tokens_2d: List[List[str]] = []
+            acts_2d: List[List[int]] = []
+            for e in entries:
+                tokens = e.get("tokens", [])
+                acts = e.get("act_values", [])
+                tokens_2d.append(tokens)
+                if max_act <= 0:
+                    acts_i = [0 for _ in tokens]
+                else:
+                    acts_i = [0 if (a is None or a < 0) else int(math.ceil(a * 10 / max_act)) for a in acts]
+                acts_2d.append(acts_i)
+            obj = {"tokens": tokens_2d, "acts": acts_2d}
+
+        if _HAS_ORJSON:
+            with open(out_fp, "wb") as f:
+                f.write(_orjson.dumps(obj, option=0))
+        else:
+            with open(out_fp, "w") as f:
+                json.dump(obj, f, ensure_ascii=False, separators=(',', ':'))
+        try:
+            os.remove(tmp_fp)
+        except Exception:
+            pass
+        return (feat_id, True)
+    except Exception:
+        return (feat_id, False)
 
 
 def collect_feature_pattern_impl(
@@ -505,9 +574,9 @@ def collect_feature_pattern_impl(
             continue
         desc = f"finalize L{layer}"
         _log(f"[FINALIZE] L{layer} start | features={total} | workers={finalize_workers}")
-        # ThreadPool for safer behavior in CUDA-loaded process; mostly I/O bound here
-        with _futures.ThreadPoolExecutor(max_workers=finalize_workers) as ex:
-            results = list(tqdm(ex.map(_finalize_one, tasks, chunksize=16), total=total, desc=desc))
+        # ProcessPool for CPU-bound JSON generation (avoid GIL)
+        with _futures.ProcessPoolExecutor(max_workers=finalize_workers) as ex:
+            results = list(tqdm(ex.map(_finalize_one_task, tasks, chunksize=8), total=total, desc=desc))
         _log(f"[FINALIZE] L{layer} done")
 
 

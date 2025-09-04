@@ -86,7 +86,7 @@ try:
     import orjson as _orjson  # type: ignore
     _HAS_ORJSON = True
 except Exception:
-_HAS_ORJSON = False
+    _HAS_ORJSON = False
 
 # --- Binary intermediate record helpers ---
 def _bin_append_record(path: str, obj: dict):

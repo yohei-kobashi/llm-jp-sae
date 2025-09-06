@@ -437,87 +437,87 @@ def collect_feature_pattern_impl(
                     needed = sample_to_features[layer]
                     if not needed:
                         continue
-                hook = hooks_model[layer]
-                sae = saes[layer]
-                out = hook.output
-                activation = out[0] if isinstance(out, tuple) else out
-                activation = activation[:, 1:, :]
-                bs, seq, _ = activation.shape
-                inf_chunks = TrainConfig().inf_bs_expansion
-                b_start = 0
-                # buffer for this batch/layer: fid -> list of records
-                layer_buffer: Dict[int, List[dict]] = {}
-                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
-                    sub_bs = act_chunk.shape[0]
-                    flat = act_chunk.flatten(0, 1)
-                    flat = normalize_activation(flat, nl).to(SAE_DEVICE)
-                    out_sae = sae(flat)
-                    latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
-                    latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
-                    for bb in range(sub_bs):
-                        b = b_start + bb
-                        sample_idx = global_sample_base + b
-                        if sample_idx not in needed:
-                            continue
-                        feats = needed[sample_idx]
-                        if b not in tokens_cache:
-                            tokens_cache[b] = [
-                                w.replace("▁", " ")
-                                for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
-                            ]
-                        tokens = tokens_cache[b]
-                        # O(seq×k) reconstruction: single pass over indices/acts to build per-fid per-token max
-                        idxs_np = latent_indices[bb].detach().to('cpu').numpy()
-                        acts_np = latent_acts[bb].detach().to('cpu').to(dtype=torch.float32).numpy()
-                        feats_set = set(feats)
-                        acc: Dict[int, Dict[int, float]] = {}
-                        for t in range(seq):
-                            idx_row = idxs_np[t]
-                            act_row = acts_np[t]
-                            for j in range(k):
-                                fid = int(idx_row[j])
-                                if fid in feats_set:
-                                    v = float(act_row[j])
-                                    d = acc.get(fid)
-                                    if d is None:
-                                        d = {}
-                                        acc[fid] = d
-                                    prev = d.get(t)
-                                    if prev is None or v > prev:
-                                        d[t] = v
+                    hook = hooks_model[layer]
+                    sae = saes[layer]
+                    out = hook.output
+                    activation = out[0] if isinstance(out, tuple) else out
+                    activation = activation[:, 1:, :]
+                    bs, seq, _ = activation.shape
+                    inf_chunks = TrainConfig().inf_bs_expansion
+                    b_start = 0
+                    # buffer for this batch/layer: fid -> list of records
+                    layer_buffer: Dict[int, List[dict]] = {}
+                    for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
+                        sub_bs = act_chunk.shape[0]
+                        flat = act_chunk.flatten(0, 1)
+                        flat = normalize_activation(flat, nl).to(SAE_DEVICE)
+                        out_sae = sae(flat)
+                        latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
+                        latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
+                        for bb in range(sub_bs):
+                            b = b_start + bb
+                            sample_idx = global_sample_base + b
+                            if sample_idx not in needed:
+                                continue
+                            feats = needed[sample_idx]
+                            if b not in tokens_cache:
+                                tokens_cache[b] = [
+                                    w.replace("▁", " ")
+                                    for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
+                                ]
+                            tokens = tokens_cache[b]
+                            # O(seq×k) reconstruction: single pass over indices/acts to build per-fid per-token max
+                            idxs_np = latent_indices[bb].detach().to('cpu').numpy()
+                            acts_np = latent_acts[bb].detach().to('cpu').to(dtype=torch.float32).numpy()
+                            feats_set = set(feats)
+                            acc: Dict[int, Dict[int, float]] = {}
+                            for t in range(seq):
+                                idx_row = idxs_np[t]
+                                act_row = acts_np[t]
+                                for j in range(k):
+                                    fid = int(idx_row[j])
+                                    if fid in feats_set:
+                                        v = float(act_row[j])
+                                        d = acc.get(fid)
+                                        if d is None:
+                                            d = {}
+                                            acc[fid] = d
+                                        prev = d.get(t)
+                                        if prev is None or v > prev:
+                                            d[t] = v
 
-                        # Optional verification against mask-based method for first few features
-                        if verify_resonstruct:
-                            for fid in feats[:min(5, len(feats))]:
-                                vals = torch.where((latent_indices[bb] == fid), latent_acts[bb], torch.zeros_like(latent_acts[bb])).max(dim=-1).values
-                                old_list = vals.detach().to('cpu').tolist()
+                            # Optional verification against mask-based method for first few features
+                            if verify_resonstruct:
+                                for fid in feats[:min(5, len(feats))]:
+                                    vals = torch.where((latent_indices[bb] == fid), latent_acts[bb], torch.zeros_like(latent_acts[bb])).max(dim=-1).values
+                                    old_list = vals.detach().to('cpu').tolist()
+                                    d = acc.get(fid, {})
+                                    new_list = [0.0]*seq
+                                    for pos, val in d.items():
+                                        new_list[pos] = val
+                                    if any(abs(a-b) > 1e-6 for a,b in zip(old_list, new_list)):
+                                        raise AssertionError(f"Reconstruct mismatch at layer {layer} sample {sample_idx} fid {fid}")
+
+                            # Write records per fid
+                            for fid in feats:
                                 d = acc.get(fid, {})
-                                new_list = [0.0]*seq
-                                for pos, val in d.items():
-                                    new_list[pos] = val
-                                if any(abs(a-b) > 1e-6 for a,b in zip(old_list, new_list)):
-                                    raise AssertionError(f"Reconstruct mismatch at layer {layer} sample {sample_idx} fid {fid}")
-
-                        # Write records per fid
-                        for fid in feats:
-                            d = acc.get(fid, {})
-                            act_values = [0.0]*seq
-                            if d:
-                                for pos, val in d.items():
-                                    act_values[pos] = val
-                            score_val = float(max(0.0, max(act_values) if act_values else 0.0))
-                            layer_buffer.setdefault(fid, []).append({
-                                "score": score_val,
-                                "tokens": tokens,
-                                "act_values": act_values,
-                            })
-                    b_start += sub_bs
-                # flush buffer for this layer once per batch
-                if layer_buffer:
-                    tmp_dir = tmp_dirs[layer]
-                    for fid, records in layer_buffer.items():
-                        tmp_fp = os.path.join(tmp_dir, f"{fid}.bin")
-                        _bin_append_many(tmp_fp, records)
+                                act_values = [0.0]*seq
+                                if d:
+                                    for pos, val in d.items():
+                                        act_values[pos] = val
+                                score_val = float(max(0.0, max(act_values) if act_values else 0.0))
+                                layer_buffer.setdefault(fid, []).append({
+                                    "score": score_val,
+                                    "tokens": tokens,
+                                    "act_values": act_values,
+                                })
+                        b_start += sub_bs
+                    # flush buffer for this layer once per batch
+                    if layer_buffer:
+                        tmp_dir = tmp_dirs[layer]
+                        for fid, records in layer_buffer.items():
+                            tmp_fp = os.path.join(tmp_dir, f"{fid}.bin")
+                            _bin_append_many(tmp_fp, records)
             global_sample_base += bs
 
     # Finalize: assemble per-feature JSONs and remove tmp, in parallel

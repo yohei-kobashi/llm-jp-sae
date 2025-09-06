@@ -378,6 +378,51 @@ def collect_feature_pattern_impl(
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_dirs[layer] = tmp_dir
 
+    # Diagnostics: summarize pending work per layer
+    try:
+        bs_effective = dl_test.batch_size or 1
+    except Exception:
+        bs_effective = 1
+    try:
+        total_batches = len(dl_test)
+    except Exception:
+        total_batches = None
+
+    for layer in layers:
+        feats_map = selected_per_layer.get(layer, {})
+        features_dir = os.path.join(save_dir, f"features_layer{layer}")
+        tmp_dir = tmp_dirs[layer]
+        total_feats = len(feats_map)
+        cnt_final = 0
+        cnt_tmp = 0
+        cnt_pass2 = 0
+        needed_samples_set = set()
+        for fid, sidx_list in feats_map.items():
+            final_json = os.path.join(features_dir, f"{fid}.json")
+            tmp_bin = os.path.join(tmp_dir, f"{fid}.bin")
+            has_final = os.path.exists(final_json)
+            has_tmp = os.path.exists(tmp_bin)
+            if has_final:
+                cnt_final += 1
+            if has_tmp:
+                cnt_tmp += 1
+            if not has_final and not has_tmp:
+                cnt_pass2 += 1
+                # accumulate needed samples (unique)
+                for sidx in sidx_list:
+                    needed_samples_set.add(int(sidx))
+        # estimate batches containing needed samples
+        needed_batches = set()
+        if bs_effective > 0:
+            for s in needed_samples_set:
+                needed_batches.add(s // bs_effective)
+        diag = f"[DIAG] L{layer} total_feats={total_feats} final.json={cnt_final} tmp.bin={cnt_tmp} pass2_needed={cnt_pass2} needed_samples={len(needed_samples_set)}"
+        if total_batches is not None:
+            diag += f" needed_batches={len(needed_batches)}/{total_batches}"
+        else:
+            diag += f" needed_batches={len(needed_batches)}"
+        _log(diag)
+
     # PASS 2: reconstruct per-token activations only for selected samples/features; write tmp jsonl
     # Skip pass2 entirely if nothing to reconstruct
     any_needed = any(len(d) > 0 for d in sample_to_features.values())

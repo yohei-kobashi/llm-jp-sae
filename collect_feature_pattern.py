@@ -127,7 +127,18 @@ def _finalize_one_task(args):
     if not os.path.exists(tmp_fp):
         return (feat_id, False)
     try:
-        entries = list(_bin_iter_records(tmp_fp))
+        # Deduplicate by sample_idx if present, keeping highest-score entry per sample
+        dedup: Dict[int, dict] = {}
+        legacy_entries: List[dict] = []
+        for e in _bin_iter_records(tmp_fp):
+            sid = e.get("sample_idx")
+            if sid is None:
+                legacy_entries.append(e)
+                continue
+            prev = dedup.get(int(sid))
+            if (prev is None) or (e.get("score", 0.0) > prev.get("score", 0.0)):
+                dedup[int(sid)] = e
+        entries = legacy_entries + list(dedup.values())
         if not entries:
             try:
                 os.remove(tmp_fp)
@@ -358,9 +369,6 @@ def collect_feature_pattern_impl(
                 # If final already exists, skip entirely (both pass2 and finalize)
                 if os.path.exists(final_json):
                     continue
-                # If tmp already exists, skip pass2 for this feature
-                if os.path.exists(tmp_bin):
-                    continue
             else:
                 # Force recompute: remove any existing tmp to avoid duplication
                 if os.path.exists(tmp_bin):
@@ -368,8 +376,19 @@ def collect_feature_pattern_impl(
                         os.remove(tmp_bin)
                     except Exception:
                         pass
+            # Determine which samples still need reconstruction for this feature
+            existing_samples = set()
+            if os.path.exists(tmp_bin):
+                try:
+                    for rec in _bin_iter_records(tmp_bin):
+                        sid = rec.get("sample_idx")
+                        if sid is not None:
+                            existing_samples.add(int(sid))
+                except Exception:
+                    pass
             for sidx in sidx_list:
-                sample_to_features[layer].setdefault(sidx, []).append(feat_id)
+                if sidx not in existing_samples:
+                    sample_to_features[layer].setdefault(sidx, []).append(feat_id)
 
     # Temp dirs for streaming writes
     tmp_dirs: Dict[int, str] = {}
@@ -404,11 +423,25 @@ def collect_feature_pattern_impl(
             has_tmp = os.path.exists(tmp_bin)
             if has_final:
                 cnt_final += 1
+                continue
             if has_tmp:
                 cnt_tmp += 1
-            if not has_final and not has_tmp:
+                # check which samples are missing
+                existing_samples = set()
+                try:
+                    for rec in _bin_iter_records(tmp_bin):
+                        sid = rec.get("sample_idx")
+                        if sid is not None:
+                            existing_samples.add(int(sid))
+                except Exception:
+                    pass
+                missing = [s for s in sidx_list if int(s) not in existing_samples]
+                if missing:
+                    cnt_pass2 += 1
+                    for sidx in missing:
+                        needed_samples_set.add(int(sidx))
+            else:
                 cnt_pass2 += 1
-                # accumulate needed samples (unique)
                 for sidx in sidx_list:
                     needed_samples_set.add(int(sidx))
         # estimate batches containing needed samples
@@ -510,6 +543,7 @@ def collect_feature_pattern_impl(
                                     "score": score_val,
                                     "tokens": tokens,
                                     "act_values": act_values,
+                                    "sample_idx": int(sample_idx),
                                 })
                         b_start += sub_bs
                     # flush buffer for this layer once per batch
@@ -528,7 +562,18 @@ def collect_feature_pattern_impl(
         if not os.path.exists(tmp_fp):
             return (feat_id, False)
         try:
-            entries = list(_bin_iter_records(tmp_fp))
+            # Deduplicate by sample_idx if present, keeping highest-score entry per sample
+            dedup: Dict[int, dict] = {}
+            legacy_entries: List[dict] = []
+            for e in _bin_iter_records(tmp_fp):
+                sid = e.get("sample_idx")
+                if sid is None:
+                    legacy_entries.append(e)
+                    continue
+                prev = dedup.get(int(sid))
+                if (prev is None) or (e.get("score", 0.0) > prev.get("score", 0.0)):
+                    dedup[int(sid)] = e
+            entries = legacy_entries + list(dedup.values())
             if not entries:
                 try:
                     os.remove(tmp_fp)

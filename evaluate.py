@@ -42,7 +42,7 @@ def evaluate():
     )
     parser.add_argument("--ckpt", type=int, default=988240, help="Checkpoint")
     parser.add_argument(
-        "--layer", type=int, default=12, help="Layer index to extract activations"
+        "--layers", type=int, nargs="+", default=None, help="Layer indices to evaluate"
     )
     parser.add_argument("--n_d", type=int, default=16, help="Expansion ratio (n/d)")
     parser.add_argument(
@@ -55,27 +55,37 @@ def evaluate():
         help="normalization method: Standardization, Scalar, None",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--label", type=str, default=None, help="Data label")
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
 
+    sae_root_dir = usr_cfg.sae_save_dir
+    if args.label:
+        sae_root_dir = args.label + sae_root_dir
     save_dir = return_save_dir(
-        usr_cfg.sae_save_dir,
-        args.layer,
+        sae_root_dir,
         args.n_d,
         args.k,
         args.nl,
         args.ckpt,
         args.lr,
     )
-    features_dir = os.path.join(save_dir, "features")
+    # Resolve layers (align with collect_feature_pattern.py default)
+    layers = args.layers or [12]
 
-    if args.eval_mode == "auto_language":
-        auto_language(features_dir)
-    elif args.eval_mode == "manual_granularity":
-        manual_granularity(features_dir)
-    else:
-        raise ValueError(f"Invalid eval_mode: {args.eval_mode}")
+    for layer in layers:
+        features_dir = os.path.join(save_dir, f"features_layer{layer}")
+        if not os.path.isdir(features_dir):
+            print(f"[WARN] features directory not found for layer {layer}: {features_dir}")
+            continue
+        print(f"[EVAL] layer={layer} dir={features_dir}")
+        if args.eval_mode == "auto_language":
+            auto_language(features_dir)
+        elif args.eval_mode == "manual_granularity":
+            manual_granularity(features_dir)
+        else:
+            raise ValueError(f"Invalid eval_mode: {args.eval_mode}")
 
 
 def detect_language(token_act, idx):

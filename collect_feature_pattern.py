@@ -702,13 +702,17 @@ def main():
         default=None,
         help="Model name or path (overrides UsrConfig.model_name_or_dir)",
     )
+    parser.add_argument("--label", type=str, default=None, help="Data label")
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
     eval_cfg = EvalConfig()
     train_cfg = TrainConfig()
 
-    test_data_pth = os.path.join(usr_cfg.tokenized_data_dir, "test_data.pt")
+    test_file_name = "test_data.pt"
+    if args.label:
+        test_file_name = args.label + test_file_name
+    test_data_pth = os.path.join(usr_cfg.tokenized_data_dir, test_file_name)
     dataset_test = CustomWikiDataset(test_data_pth)
     dl_test = DataLoader(
         dataset_test,
@@ -724,8 +728,11 @@ def main():
     # Resolve layers
     layers = args.layers or [12]
 
+    sae_root_dir = usr_cfg.sae_save_dir
+    if args.label:
+        sae_root_dir = args.label + sae_root_dir
     save_dir = return_save_dir(
-        usr_cfg.sae_save_dir,
+        sae_root_dir,
         args.n_d,
         args.k,
         args.nl,

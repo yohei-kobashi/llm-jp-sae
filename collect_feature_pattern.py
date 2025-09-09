@@ -265,6 +265,50 @@ def collect_feature_pattern_impl(
             pass1_layers.append(layer)
     counter = 0  # global tie-breaker
 
+    # If full recompute is requested, clean all prior outputs for target layers
+    if no_skip:
+        for layer in layers:
+            # Remove pass1 selection file
+            try:
+                p1 = os.path.join(save_dir, f"pass1_selected_layer{layer}.json")
+                if os.path.exists(p1):
+                    os.remove(p1)
+            except Exception:
+                pass
+            # Remove pass2 progress index
+            try:
+                progress_fp = os.path.join(save_dir, f"pass2_progress_layer{layer}.jsonl")
+                if os.path.exists(progress_fp):
+                    os.remove(progress_fp)
+            except Exception:
+                pass
+            # Remove finalized feature JSONs
+            try:
+                features_dir = os.path.join(save_dir, f"features_layer{layer}")
+                if os.path.isdir(features_dir):
+                    for name in os.listdir(features_dir):
+                        fp = os.path.join(features_dir, name)
+                        try:
+                            if os.path.isfile(fp):
+                                os.remove(fp)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Remove temporary BINs
+            try:
+                tmp_dir = os.path.join(save_dir, f"tmp_features_layer{layer}")
+                if os.path.isdir(tmp_dir):
+                    for name in os.listdir(tmp_dir):
+                        fp = os.path.join(tmp_dir, name)
+                        try:
+                            if os.path.isfile(fp):
+                                os.remove(fp)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     for layer in layers:
         # SAE per layer
         if DEBUG:

@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dataset import ActivationRecord, CustomWikiDataset, FeatureRecord
 import heapq
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import time
 import pickle
 import numpy as np
@@ -355,6 +355,29 @@ def collect_feature_pattern_impl(
             except Exception:
                 pass
 
+    # Load per-layer pass2 progress (fid -> set(sample_idx)) from compact JSONL
+    processed_per_layer: Dict[int, Dict[int, Set[int]]] = {}
+    for layer in layers:
+        processed_per_layer[layer] = {}
+        progress_fp = os.path.join(save_dir, f"pass2_progress_layer{layer}.jsonl")
+        if os.path.exists(progress_fp):
+            try:
+                with open(progress_fp, 'r') as pf:
+                    for line in pf:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            fid = int(obj.get("fid"))
+                            sidx = int(obj.get("sidx"))
+                            processed_per_layer[layer].setdefault(fid, set()).add(sidx)
+                        except Exception:
+                            # Ignore malformed lines
+                            continue
+            except Exception:
+                pass
+
     sample_to_features: Dict[int, Dict[int, List[int]]] = {layer: {} for layer in layers}
     for layer in layers:
         feats_map = selected_per_layer.get(layer, {})
@@ -376,19 +399,11 @@ def collect_feature_pattern_impl(
                         os.remove(tmp_bin)
                     except Exception:
                         pass
-            # Determine which samples still need reconstruction for this feature
-            existing_samples = set()
-            if os.path.exists(tmp_bin):
-                try:
-                    for rec in _bin_iter_records(tmp_bin):
-                        sid = rec.get("sample_idx")
-                        if sid is not None:
-                            existing_samples.add(int(sid))
-                except Exception:
-                    pass
+            # Determine which samples still need reconstruction for this feature using progress JSONL
+            existing_samples = processed_per_layer.get(layer, {}).get(int(feat_id), set())
             for sidx in sidx_list:
-                if sidx not in existing_samples:
-                    sample_to_features[layer].setdefault(sidx, []).append(feat_id)
+                if int(sidx) not in existing_samples:
+                    sample_to_features[layer].setdefault(int(sidx), []).append(int(feat_id))
 
     # Temp dirs for streaming writes
     tmp_dirs: Dict[int, str] = {}
@@ -426,23 +441,11 @@ def collect_feature_pattern_impl(
                 continue
             if has_tmp:
                 cnt_tmp += 1
-                # check which samples are missing
-                existing_samples = set()
-                try:
-                    for rec in _bin_iter_records(tmp_bin):
-                        sid = rec.get("sample_idx")
-                        if sid is not None:
-                            existing_samples.add(int(sid))
-                except Exception:
-                    pass
-                missing = [s for s in sidx_list if int(s) not in existing_samples]
-                if missing:
-                    cnt_pass2 += 1
-                    for sidx in missing:
-                        needed_samples_set.add(int(sidx))
-            else:
+            existing_samples = processed_per_layer.get(layer, {}).get(int(fid), set())
+            missing = [s for s in sidx_list if int(s) not in existing_samples]
+            if missing:
                 cnt_pass2 += 1
-                for sidx in sidx_list:
+                for sidx in missing:
                     needed_samples_set.add(int(sidx))
         # estimate batches containing needed samples
         needed_batches = set()
@@ -480,6 +483,7 @@ def collect_feature_pattern_impl(
                     b_start = 0
                     # buffer for this batch/layer: fid -> list of records
                     layer_buffer: Dict[int, List[dict]] = {}
+                    progress_lines: List[str] = []
                     for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
                         sub_bs = act_chunk.shape[0]
                         flat = act_chunk.flatten(0, 1)
@@ -545,6 +549,7 @@ def collect_feature_pattern_impl(
                                     "act_values": act_values,
                                     "sample_idx": int(sample_idx),
                                 })
+                                progress_lines.append(json.dumps({"fid": int(fid), "sidx": int(sample_idx)}, separators=(',', ':')))
                         b_start += sub_bs
                     # flush buffer for this layer once per batch
                     if layer_buffer:
@@ -552,6 +557,13 @@ def collect_feature_pattern_impl(
                         for fid, records in layer_buffer.items():
                             tmp_fp = os.path.join(tmp_dir, f"{fid}.bin")
                             _bin_append_many(tmp_fp, records)
+                        if progress_lines:
+                            progress_fp = os.path.join(save_dir, f"pass2_progress_layer{layer}.jsonl")
+                            try:
+                                with open(progress_fp, 'a') as pf:
+                                    pf.write("\n".join(progress_lines) + "\n")
+                            except Exception:
+                                pass
             global_sample_base += bs
 
     # Finalize: assemble per-feature JSONs and remove tmp, in parallel

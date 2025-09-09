@@ -528,6 +528,7 @@ def collect_feature_pattern_impl(
                     # buffer for this batch/layer: fid -> list of records
                     layer_buffer: Dict[int, List[dict]] = {}
                     progress_lines: List[str] = []
+                    progress_new: Dict[int, Set[int]] = {}
                     for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
                         sub_bs = act_chunk.shape[0]
                         flat = act_chunk.flatten(0, 1)
@@ -594,6 +595,7 @@ def collect_feature_pattern_impl(
                                     "sample_idx": int(sample_idx),
                                 })
                                 progress_lines.append(json.dumps({"fid": int(fid), "sidx": int(sample_idx)}, separators=(',', ':')))
+                                progress_new.setdefault(int(fid), set()).add(int(sample_idx))
                         b_start += sub_bs
                     # flush buffer for this layer once per batch
                     if layer_buffer:
@@ -608,6 +610,11 @@ def collect_feature_pattern_impl(
                                     pf.write("\n".join(progress_lines) + "\n")
                             except Exception:
                                 pass
+                            # update in-memory processed_per_layer so finalize can see completeness without reread
+                            layer_proc = processed_per_layer.setdefault(layer, {})
+                            for fid, sset in progress_new.items():
+                                cur = layer_proc.setdefault(int(fid), set())
+                                cur.update(sset)
             global_sample_base += bs
 
     # Finalize: assemble per-feature JSONs and remove tmp, in parallel
@@ -703,16 +710,18 @@ def collect_feature_pattern_impl(
         features_dir = os.path.join(save_dir, f"features_layer{layer}")
         os.makedirs(features_dir, exist_ok=True)
         tmp_dir = tmp_dirs[layer]
-        if no_skip:
-            feat_ids = [
-                fid for fid in selected_per_layer.get(layer, {}).keys()
-                if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin"))
-            ]
-        else:
-            feat_ids = [
-                fid for fid in selected_per_layer.get(layer, {}).keys()
-                if os.path.exists(os.path.join(tmp_dir, f"{fid}.bin")) and not os.path.exists(os.path.join(features_dir, f"{fid}.json"))
-            ]
+        sel = selected_per_layer.get(layer, {})
+        proc = processed_per_layer.get(layer, {})
+        # Only finalize features that are complete: processed_count >= expected_count
+        feat_ids = []
+        for fid, sidx_list in sel.items():
+            tmp_path = os.path.join(tmp_dir, f"{fid}.bin")
+            final_path = os.path.join(features_dir, f"{fid}.json")
+            if os.path.exists(tmp_path) and not os.path.exists(final_path):
+                processed_cnt = len(proc.get(int(fid), set()))
+                expected_cnt = len(sidx_list)
+                if processed_cnt >= expected_cnt:
+                    feat_ids.append(fid)
         tasks = [(layer, fid, tmp_dir, features_dir, final_format) for fid in feat_ids]
         total = len(tasks)
         if total == 0:

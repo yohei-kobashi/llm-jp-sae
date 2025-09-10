@@ -308,6 +308,57 @@ def collect_feature_pattern_impl(
                             pass
             except Exception:
                 pass
+        # Remove global pass2 resume pointer
+        try:
+            resume_fp = os.path.join(save_dir, "pass2_resume.json")
+            if os.path.exists(resume_fp):
+                os.remove(resume_fp)
+        except Exception:
+            pass
+
+    # If full recompute is requested, clean all prior outputs for target layers
+    if no_skip:
+        for layer in layers:
+            # Remove pass1 selection file
+            try:
+                p1 = os.path.join(save_dir, f"pass1_selected_layer{layer}.json")
+                if os.path.exists(p1):
+                    os.remove(p1)
+            except Exception:
+                pass
+            # Remove pass2 progress index
+            try:
+                progress_fp = os.path.join(save_dir, f"pass2_progress_layer{layer}.jsonl")
+                if os.path.exists(progress_fp):
+                    os.remove(progress_fp)
+            except Exception:
+                pass
+            # Remove finalized feature JSONs
+            try:
+                features_dir = os.path.join(save_dir, f"features_layer{layer}")
+                if os.path.isdir(features_dir):
+                    for name in os.listdir(features_dir):
+                        fp = os.path.join(features_dir, name)
+                        try:
+                            if os.path.isfile(fp):
+                                os.remove(fp)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Remove temporary BINs
+            try:
+                tmp_dir = os.path.join(save_dir, f"tmp_features_layer{layer}")
+                if os.path.isdir(tmp_dir):
+                    for name in os.listdir(tmp_dir):
+                        fp = os.path.join(tmp_dir, name)
+                        try:
+                            if os.path.isfile(fp):
+                                os.remove(fp)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     for layer in layers:
         # SAE per layer
@@ -399,6 +450,17 @@ def collect_feature_pattern_impl(
             except Exception:
                 pass
 
+    # Load global pass2 resume pointer (last processed sample_idx, inclusive)
+    resume_fp = os.path.join(save_dir, "pass2_resume.json")
+    resume_sample_idx = -1
+    if os.path.exists(resume_fp) and (not no_skip):
+        try:
+            with open(resume_fp, 'r') as rf:
+                obj = json.load(rf)
+                resume_sample_idx = int(obj.get("last_sample_idx", -1))
+        except Exception:
+            resume_sample_idx = -1
+
     # Load per-layer pass2 progress (fid -> set(sample_idx)) from compact JSONL
     processed_per_layer: Dict[int, Dict[int, Set[int]]] = {}
     for layer in layers:
@@ -422,33 +484,6 @@ def collect_feature_pattern_impl(
             except Exception:
                 pass
 
-    sample_to_features: Dict[int, Dict[int, List[int]]] = {layer: {} for layer in layers}
-    for layer in layers:
-        feats_map = selected_per_layer.get(layer, {})
-        features_dir = os.path.join(save_dir, f"features_layer{layer}")
-        os.makedirs(features_dir, exist_ok=True)
-        tmp_dir = os.path.join(save_dir, f"tmp_features_layer{layer}")
-        os.makedirs(tmp_dir, exist_ok=True)
-        for feat_id, sidx_list in feats_map.items():
-            final_json = os.path.join(features_dir, f"{feat_id}.json")
-            tmp_bin = os.path.join(tmp_dir, f"{feat_id}.bin")
-            if not no_skip:
-                # If final already exists, skip entirely (both pass2 and finalize)
-                if os.path.exists(final_json):
-                    continue
-            else:
-                # Force recompute: remove any existing tmp to avoid duplication
-                if os.path.exists(tmp_bin):
-                    try:
-                        os.remove(tmp_bin)
-                    except Exception:
-                        pass
-            # Determine which samples still need reconstruction for this feature using progress JSONL
-            existing_samples = processed_per_layer.get(layer, {}).get(int(feat_id), set())
-            for sidx in sidx_list:
-                if int(sidx) not in existing_samples:
-                    sample_to_features[layer].setdefault(int(sidx), []).append(int(feat_id))
-
     # Temp dirs for streaming writes
     tmp_dirs: Dict[int, str] = {}
     for layer in layers:
@@ -456,165 +491,223 @@ def collect_feature_pattern_impl(
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_dirs[layer] = tmp_dir
 
-    # Diagnostics: summarize pending work per layer
-    try:
-        bs_effective = dl_test.batch_size or 1
-    except Exception:
-        bs_effective = 1
-    try:
-        total_batches = len(dl_test)
-    except Exception:
-        total_batches = None
+    # Build and open streaming index: sidx -> [fids]
+    def _by_sample_path(layer: int) -> str:
+        return os.path.join(save_dir, f"pass1_selected_by_sample_layer{layer}.jsonl")
 
     for layer in layers:
-        feats_map = selected_per_layer.get(layer, {})
-        features_dir = os.path.join(save_dir, f"features_layer{layer}")
-        tmp_dir = tmp_dirs[layer]
-        total_feats = len(feats_map)
-        cnt_final = 0
-        cnt_tmp = 0
-        cnt_pass2 = 0
-        needed_samples_set = set()
-        for fid, sidx_list in feats_map.items():
-            final_json = os.path.join(features_dir, f"{fid}.json")
-            tmp_bin = os.path.join(tmp_dir, f"{fid}.bin")
-            has_final = os.path.exists(final_json)
-            has_tmp = os.path.exists(tmp_bin)
-            if has_final:
-                cnt_final += 1
+        by_sample_fp = _by_sample_path(layer)
+        sel = selected_per_layer.get(layer, {})
+        if no_skip or (not os.path.exists(by_sample_fp)):
+            # invert fid->sidx to sidx->fids
+            s2f: Dict[int, List[int]] = {}
+            for fid, sidx_list in sel.items():
+                for s in sidx_list:
+                    s2f.setdefault(int(s), []).append(int(fid))
+            # write ascending by sidx
+            try:
+                with open(by_sample_fp, 'w') as wf:
+                    for sidx in sorted(s2f.keys()):
+                        wf.write(json.dumps({"sidx": int(sidx), "fids": s2f[int(sidx)]}, separators=(',', ':')) + "\n")
+            except Exception:
+                pass
+
+    # Open per-layer readers and fast-forward to resume pointer
+    readers: Dict[int, dict] = {}
+    for layer in layers:
+        try:
+            f = open(_by_sample_path(layer), 'r')
+        except Exception:
+            readers[layer] = {"fh": None, "next": None}
+            continue
+        nxt = None
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            try:
+                obj = json.loads(line)
+            except Exception:
+                # skip malformed line and continue
                 continue
-            if has_tmp:
-                cnt_tmp += 1
-            existing_samples = processed_per_layer.get(layer, {}).get(int(fid), set())
-            missing = [s for s in sidx_list if int(s) not in existing_samples]
-            if missing:
-                cnt_pass2 += 1
-                for sidx in missing:
-                    needed_samples_set.add(int(sidx))
-        # estimate batches containing needed samples
-        needed_batches = set()
-        if bs_effective > 0:
-            for s in needed_samples_set:
-                needed_batches.add(s // bs_effective)
-        diag = f"[DIAG] L{layer} total_feats={total_feats} final.json={cnt_final} tmp.bin={cnt_tmp} pass2_needed={cnt_pass2} needed_samples={len(needed_samples_set)}"
-        if total_batches is not None:
-            diag += f" needed_batches={len(needed_batches)}/{total_batches}"
-        else:
-            diag += f" needed_batches={len(needed_batches)}"
-        _log(diag)
+            try:
+                si = int(obj.get("sidx", -1))
+            except Exception:
+                continue
+            if resume_sample_idx >= 0 and si <= resume_sample_idx:
+                continue
+            nxt = obj
+            break
+        readers[layer] = {"fh": f, "next": nxt}
 
-    # PASS 2: reconstruct per-token activations only for selected samples/features; write tmp jsonl
-    # Skip pass2 entirely if nothing to reconstruct
-    any_needed = any(len(d) > 0 for d in sample_to_features.values())
-    if any_needed:
-        with torch.inference_mode():
-            global_sample_base = 0
-            for step, batch in enumerate(tqdm(dl_test, desc="pass2-reconstruct")):
-                batch = batch.to(MODEL_DEVICE)
-                _ = model(batch, use_cache=False)
-                tokens_cache: Dict[int, List[str]] = {}
-                for layer in layers:
-                    needed = sample_to_features[layer]
-                    if not needed:
-                        continue
-                    hook = hooks_model[layer]
-                    sae = saes[layer]
-                    out = hook.output
-                    activation = out[0] if isinstance(out, tuple) else out
-                    activation = activation[:, 1:, :]
-                    bs, seq, _ = activation.shape
-                    inf_chunks = TrainConfig().inf_bs_expansion
-                    b_start = 0
-                    # buffer for this batch/layer: fid -> list of records
-                    layer_buffer: Dict[int, List[dict]] = {}
-                    progress_lines: List[str] = []
-                    progress_new: Dict[int, Set[int]] = {}
-                    for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
-                        sub_bs = act_chunk.shape[0]
-                        flat = act_chunk.flatten(0, 1)
-                        flat = normalize_activation(flat, nl).to(SAE_DEVICE)
-                        out_sae = sae(flat)
-                        latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
-                        latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
-                        for bb in range(sub_bs):
-                            b = b_start + bb
-                            sample_idx = global_sample_base + b
-                            if sample_idx not in needed:
-                                continue
-                            feats = needed[sample_idx]
-                            if b not in tokens_cache:
-                                tokens_cache[b] = [
-                                    w.replace("▁", " ")
-                                    for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
-                                ]
-                            tokens = tokens_cache[b]
-                            # O(seq×k) reconstruction: single pass over indices/acts to build per-fid per-token max
-                            idxs_np = latent_indices[bb].detach().to('cpu').numpy()
-                            acts_np = latent_acts[bb].detach().to('cpu').to(dtype=torch.float32).numpy()
-                            feats_set = set(feats)
-                            acc: Dict[int, Dict[int, float]] = {}
-                            for t in range(seq):
-                                idx_row = idxs_np[t]
-                                act_row = acts_np[t]
-                                for j in range(k):
-                                    fid = int(idx_row[j])
-                                    if fid in feats_set:
-                                        v = float(act_row[j])
-                                        d = acc.get(fid)
-                                        if d is None:
-                                            d = {}
-                                            acc[fid] = d
-                                        prev = d.get(t)
-                                        if prev is None or v > prev:
-                                            d[t] = v
+    # PASS 2 (streaming): use per-layer sidx->fids index; process batch windows only when needed
+    with torch.inference_mode():
+        global_sample_base = 0
+        for step, batch in enumerate(tqdm(dl_test, desc="pass2-reconstruct")):
+            # Determine batch window [start_idx, end_idx]
+            try:
+                bs = batch.shape[0]
+            except Exception:
+                bs = dl_test.batch_size or 1
+            start_idx = global_sample_base
+            end_idx = global_sample_base + bs - 1
 
-                            # Optional verification against mask-based method for first few features
-                            if verify_resonstruct:
-                                for fid in feats[:min(5, len(feats))]:
-                                    vals = torch.where((latent_indices[bb] == fid), latent_acts[bb], torch.zeros_like(latent_acts[bb])).max(dim=-1).values
-                                    old_list = vals.detach().to('cpu').tolist()
-                                    d = acc.get(fid, {})
-                                    new_list = [0.0]*seq
-                                    for pos, val in d.items():
-                                        new_list[pos] = val
-                                    if any(abs(a-b) > 1e-6 for a,b in zip(old_list, new_list)):
-                                        raise AssertionError(f"Reconstruct mismatch at layer {layer} sample {sample_idx} fid {fid}")
+            # Collect needed per layer for this batch
+            needed_per_layer: Dict[int, Dict[int, List[int]]] = {layer: {} for layer in layers}
+            any_needed = False
+            for layer in layers:
+                rdr = readers.get(layer, {})
+                fh = rdr.get("fh")
+                nxt = rdr.get("next")
+                if fh is None:
+                    continue
+                # consume lines up to end_idx
+                while nxt is not None and int(nxt.get("sidx", -1)) <= end_idx:
+                    si = int(nxt.get("sidx"))
+                    if si >= start_idx:
+                        fids = [int(x) for x in nxt.get("fids", [])]
+                        proc_map = processed_per_layer.get(layer, {})
+                        fil = []
+                        for fid in fids:
+                            if si not in proc_map.get(int(fid), set()):
+                                fil.append(int(fid))
+                        if fil:
+                            needed_per_layer[layer][si] = fil
+                            any_needed = True
+                    # read next valid record, skipping malformed lines
+                    while True:
+                        line = fh.readline()
+                        if not line:
+                            nxt = None
+                            break
+                        try:
+                            nxt = json.loads(line)
+                            break
+                        except Exception:
+                            continue
+                rdr["next"] = nxt
 
-                            # Write records per fid
-                            for fid in feats:
+            if not any_needed:
+                # Update resume pointer and advance
+                try:
+                    tmp_fp = os.path.join(save_dir, "pass2_resume.json.tmp")
+                    with open(tmp_fp, 'w') as tf:
+                        json.dump({"last_sample_idx": int(end_idx)}, tf, separators=(',', ':'))
+                    os.replace(tmp_fp, os.path.join(save_dir, "pass2_resume.json"))
+                except Exception:
+                    pass
+                # keep in-memory pointer in sync
+                resume_sample_idx = end_idx
+                global_sample_base += bs
+                continue
+
+            batch = batch.to(MODEL_DEVICE)
+            _ = model(batch, use_cache=False)
+            tokens_cache: Dict[int, List[str]] = {}
+            for layer in layers:
+                needed = needed_per_layer[layer]
+                if not needed:
+                    continue
+                hook = hooks_model[layer]
+                sae = saes[layer]
+                out = hook.output
+                activation = out[0] if isinstance(out, tuple) else out
+                activation = activation[:, 1:, :]
+                bs_act, seq, _ = activation.shape
+                inf_chunks = TrainConfig().inf_bs_expansion
+                b_start = 0
+                layer_buffer: Dict[int, List[dict]] = {}
+                progress_lines: List[str] = []
+                progress_new: Dict[int, Set[int]] = {}
+                for act_chunk in torch.chunk(activation, inf_chunks, dim=0):
+                    sub_bs = act_chunk.shape[0]
+                    flat = act_chunk.flatten(0, 1)
+                    flat = normalize_activation(flat, nl).to(SAE_DEVICE)
+                    out_sae = sae(flat)
+                    latent_indices = out_sae.latent_indices.view(sub_bs, seq, k)
+                    latent_acts = out_sae.latent_acts.view(sub_bs, seq, k)
+                    for bb in range(sub_bs):
+                        b = b_start + bb
+                        sample_idx = global_sample_base + b
+                        feats = needed.get(sample_idx)
+                        if not feats:
+                            continue
+                        if b not in tokens_cache:
+                            tokens_cache[b] = [
+                                w.replace("▁", " ")
+                                for w in tokenizer.convert_ids_to_tokens(batch[b][1:].tolist())
+                            ]
+                        tokens = tokens_cache[b]
+                        idxs_np = latent_indices[bb].detach().to('cpu').numpy()
+                        acts_np = latent_acts[bb].detach().to('cpu').to(dtype=torch.float32).numpy()
+                        feats_set = set(feats)
+                        acc: Dict[int, Dict[int, float]] = {}
+                        for t in range(seq):
+                            idx_row = idxs_np[t]
+                            act_row = acts_np[t]
+                            for j in range(k):
+                                fid = int(idx_row[j])
+                                if fid in feats_set:
+                                    v = float(act_row[j])
+                                    d = acc.get(fid)
+                                    if d is None:
+                                        d = {}
+                                        acc[fid] = d
+                                    prev = d.get(t)
+                                    if prev is None or v > prev:
+                                        d[t] = v
+                        if verify_resonstruct:
+                            for fid in feats[:min(5, len(feats))]:
+                                vals = torch.where((latent_indices[bb] == fid), latent_acts[bb], torch.zeros_like(latent_acts[bb])).max(dim=-1).values
+                                old_list = vals.detach().to('cpu').tolist()
                                 d = acc.get(fid, {})
-                                act_values = [0.0]*seq
-                                if d:
-                                    for pos, val in d.items():
-                                        act_values[pos] = val
-                                score_val = float(max(0.0, max(act_values) if act_values else 0.0))
-                                layer_buffer.setdefault(fid, []).append({
-                                    "score": score_val,
-                                    "tokens": tokens,
-                                    "act_values": act_values,
-                                    "sample_idx": int(sample_idx),
-                                })
-                                progress_lines.append(json.dumps({"fid": int(fid), "sidx": int(sample_idx)}, separators=(',', ':')))
-                                progress_new.setdefault(int(fid), set()).add(int(sample_idx))
-                        b_start += sub_bs
-                    # flush buffer for this layer once per batch
-                    if layer_buffer:
-                        tmp_dir = tmp_dirs[layer]
-                        for fid, records in layer_buffer.items():
-                            tmp_fp = os.path.join(tmp_dir, f"{fid}.bin")
-                            _bin_append_many(tmp_fp, records)
-                        if progress_lines:
-                            progress_fp = os.path.join(save_dir, f"pass2_progress_layer{layer}.jsonl")
-                            try:
-                                with open(progress_fp, 'a') as pf:
-                                    pf.write("\n".join(progress_lines) + "\n")
-                            except Exception:
-                                pass
-                            # update in-memory processed_per_layer so finalize can see completeness without reread
-                            layer_proc = processed_per_layer.setdefault(layer, {})
-                            for fid, sset in progress_new.items():
-                                cur = layer_proc.setdefault(int(fid), set())
-                                cur.update(sset)
+                                new_list = [0.0]*seq
+                                for pos, val in d.items():
+                                    new_list[pos] = val
+                                if any(abs(a-b) > 1e-6 for a,b in zip(old_list, new_list)):
+                                    raise AssertionError(f"Reconstruct mismatch at layer {layer} sample {sample_idx} fid {fid}")
+                        for fid in feats:
+                            d = acc.get(fid, {})
+                            act_values = [0.0]*seq
+                            if d:
+                                for pos, val in d.items():
+                                    act_values[pos] = val
+                            score_val = float(max(0.0, max(act_values) if act_values else 0.0))
+                            layer_buffer.setdefault(fid, []).append({
+                                "score": score_val,
+                                "tokens": tokens,
+                                "act_values": act_values,
+                                "sample_idx": int(sample_idx),
+                            })
+                            progress_lines.append(json.dumps({"fid": int(fid), "sidx": int(sample_idx)}, separators=(',', ':')))
+                            progress_new.setdefault(int(fid), set()).add(int(sample_idx))
+                    b_start += sub_bs
+                if layer_buffer:
+                    tmp_dir = tmp_dirs[layer]
+                    for fid, records in layer_buffer.items():
+                        tmp_fp = os.path.join(tmp_dir, f"{fid}.bin")
+                        _bin_append_many(tmp_fp, records)
+                    if progress_lines:
+                        progress_fp = os.path.join(save_dir, f"pass2_progress_layer{layer}.jsonl")
+                        try:
+                            with open(progress_fp, 'a') as pf:
+                                pf.write("\n".join(progress_lines) + "\n")
+                        except Exception:
+                            pass
+                        layer_proc = processed_per_layer.setdefault(layer, {})
+                        for fid, sset in progress_new.items():
+                            cur = layer_proc.setdefault(int(fid), set())
+                            cur.update(sset)
+            # update resume pointer for this batch and advance
+            try:
+                tmp_fp = os.path.join(save_dir, "pass2_resume.json.tmp")
+                with open(tmp_fp, 'w') as tf:
+                    json.dump({"last_sample_idx": int(end_idx)}, tf, separators=(',', ':'))
+                os.replace(tmp_fp, os.path.join(save_dir, "pass2_resume.json"))
+            except Exception:
+                pass
+            # keep in-memory pointer in sync
+            resume_sample_idx = end_idx
             global_sample_base += bs
 
     # Finalize: assemble per-feature JSONs and remove tmp, in parallel
@@ -717,11 +810,19 @@ def collect_feature_pattern_impl(
         for fid, sidx_list in sel.items():
             tmp_path = os.path.join(tmp_dir, f"{fid}.bin")
             final_path = os.path.join(features_dir, f"{fid}.json")
-            if os.path.exists(tmp_path) and not os.path.exists(final_path):
-                processed_cnt = len(proc.get(int(fid), set()))
-                expected_cnt = len(sidx_list)
-                if processed_cnt >= expected_cnt:
-                    feat_ids.append(fid)
+            if not (os.path.exists(tmp_path) and not os.path.exists(final_path)):
+                continue
+            processed_cnt = len(proc.get(int(fid), set()))
+            expected_cnt = len(sidx_list)
+            complete = processed_cnt >= expected_cnt
+            # Fallback: if no JSONL info, allow finalize only if all selected sidx are <= resume pointer
+            if (not complete) and (processed_cnt == 0) and (resume_sample_idx >= 0):
+                try:
+                    complete = all(int(x) <= resume_sample_idx for x in sidx_list)
+                except Exception:
+                    complete = False
+            if complete:
+                feat_ids.append(fid)
         tasks = [(layer, fid, tmp_dir, features_dir, final_format) for fid in feat_ids]
         total = len(tasks)
         if total == 0:

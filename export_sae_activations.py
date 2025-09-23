@@ -6,6 +6,7 @@ Usage example:
     python3 modality_data/export_sae_activations.py \
         --layers 12 13 --n_d 16 --k 32 --nl Scalar \
         --ckpt 988240 --lr 1e-3 \
+        --label experiment1 \
         --input-csv modality_data/qp_modality_list_v1.csv \
         --output-dir modality_data
 
@@ -14,7 +15,7 @@ modal markers from `Marked_Sentence_English`, extracts latent activations for
 each requested layer, and exports the original CSV columns together with SAE
 features in layer-specific Parquet files. Pass `--label` when the SAE was
 trained with a label prefix so the script looks in the matching checkpoint
-directory.
+directory and automatically appends the label to output filenames.
 """
 
 import argparse
@@ -323,6 +324,12 @@ def run(args: argparse.Namespace) -> None:
     cleaned = [_remove_markers(text) for text in sentences]
     pairs: List[Tuple[str, str]] = list(zip(sentences, cleaned))
 
+    label_suffix = f"_{args.label}" if args.label else ""
+    template_kwargs_base = {
+        "label": args.label or "",
+        "label_suffix": label_suffix,
+    }
+
     for layer in args.layers:
         layer_df = _collect_layer(
             layer=layer,
@@ -333,7 +340,9 @@ def run(args: argparse.Namespace) -> None:
             tokenizer=tokenizer,
             save_dir=save_dir,
         )
-        layer_path = os.path.join(args.output_dir, args.output_template.format(layer=layer))
+        template_kwargs = dict(template_kwargs_base, layer=layer)
+        layer_filename = args.output_template.format(**template_kwargs)
+        layer_path = os.path.join(args.output_dir, layer_filename)
         layer_df.to_parquet(layer_path, index=False)
         print(f"[INFO] saved {len(layer_df)} rows to {layer_path}")
 
@@ -361,8 +370,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-template",
-        default="qp_modality_sae_layer{layer}.parquet",
-        help="Filename template for each layer (must contain '{layer}').",
+        default="qp_modality_sae{label_suffix}_layer{layer}.parquet",
+        help=(
+            "Filename template for each layer. Must contain '{layer}'. Optional"
+            " placeholders '{label}' and '{label_suffix}' are replaced when a"
+            " label is provided."
+        ),
     )
     parser.add_argument(
         "--layers",

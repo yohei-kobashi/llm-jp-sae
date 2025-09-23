@@ -193,7 +193,11 @@ def _extract_batch(
     with torch.no_grad():
         _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
-    acts = hook.output if layer == 0 else hook.output[0]
+    acts = hook.output
+    if isinstance(acts, tuple):
+        acts = acts[0]
+    if acts.dim() == 2:
+        acts = acts.unsqueeze(0)
     acts = acts[:, 1:, :]
     mask = attention_mask[:, 1:]
     records: List[Dict[str, Any]] = []

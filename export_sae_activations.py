@@ -411,9 +411,11 @@ def parse_args() -> argparse.Namespace:
         help="Root directory that contains saved SAE checkpoints (defaults to config).",
     )
     parser.add_argument(
+        "--model_name_or_dir",
         "--model-name-or-dir",
         type=str,
         default=None,
+        dest="model_name_or_dir",
         help="Model name or path to load (defaults to config).",
     )
     parser.add_argument(

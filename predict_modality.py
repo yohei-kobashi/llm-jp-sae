@@ -429,7 +429,7 @@ def main():
     print(f"Total tasks: {len(tasks)}")
 
     # Choose worker count carefully (physical cores or half if memory is tight)
-    max_workers = min(os.cpu_count() or 2, 8)  # example cap at 8
+    max_workers = min(os.cpu_count() or 2, 20)  # example cap at 8
     print(f"Launching ProcessPoolExecutor with max_workers={max_workers}")
 
     results = []

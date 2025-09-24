@@ -229,6 +229,7 @@ def sentence_pool_sum_modal_only(tokens, indices_per_token, acts_per_token, targ
 def select_and_encode_labels(df, target_option):
     """
     Build a filtered DataFrame and a string label series based on `target_option`.
+    After removing 'unknown' tokens, categories with fewer than 5 samples are also dropped.
     Returns: filtered_df, label_str_series, dropped_count, option_used
     """
     option = target_option.lower().strip()
@@ -265,9 +266,24 @@ def select_and_encode_labels(df, target_option):
     else:
         raise ValueError(f"Unknown TARGET_OPTION: {target_option}")
 
+    # Step 1: filter out "unknown"
     filtered_df = df[filt].reset_index(drop=True)
+    label = label.reset_index(drop=True)
     dropped = int((~filt).sum())
-    return filtered_df, label.reset_index(drop=True), dropped, option
+
+    # Step 2: drop categories with < 5 samples
+    counts = label.value_counts()
+    valid_classes = counts[counts >= 5].index
+    keep_final = label.isin(valid_classes)
+    dropped_small = int((~keep_final).sum())
+
+    filtered_df = filtered_df[keep_final].reset_index(drop=True)
+    label = label[keep_final].reset_index(drop=True)
+
+    # Update total dropped count
+    dropped += dropped_small
+
+    return filtered_df, label, dropped, option
 
 
 def build_X_y(df, target_option):

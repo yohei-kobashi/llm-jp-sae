@@ -62,13 +62,13 @@ RANDOM_STATE = 42
 USE_MODAL_TOKEN_ONLY = False   # True: only tokens equal to surface Modal_Verb are pooled
 
 # Logistic regression core settings
-C_FIXED = 1.0
 SOLVER = "saga"
 PENALTY = "l1"
 N_JOBS = 1                     # Important: 1 per process; parallelism is at process level
 MULTI_CLASS = "auto"           # Quiet deprecation; >=1.7 will default to multinomial
 
 # Minimal hyperparameter schedule
+Cs = [0.25, 0.5, 1]
 HP_SCHEDULE = [
     {"max_iter": 1000, "tol": 1e-4},
     {"max_iter": 2000, "tol": 1e-4},
@@ -273,12 +273,12 @@ def build_X_y(df, target_option):
     return X, y, D, le, len(df2), n_dropped, list(le.classes_)
 
 # ---------- Model helpers ----------
-def fit_logreg(X, y, tol, max_iter, class_weight):
+def fit_logreg(X, y, C, tol, max_iter, class_weight):
     """Fit multinomial logistic regression with L1; suppress ConvergenceWarning."""
     clf = LogisticRegression(
         solver=SOLVER,
         penalty=PENALTY,
-        C=C_FIXED,
+        C=C,
         tol=tol,
         max_iter=max_iter,
         n_jobs=N_JOBS,
@@ -305,7 +305,7 @@ def run_one_task(task):
     """
     One (file, target, hp, class_weight) combination -> result dict.
     """
-    path, target_option, hp, class_weight = task
+    path, target_option, c, hp, class_weight = task
     file_name = os.path.basename(path)
     try:
         df = pd.read_parquet(path)
@@ -328,7 +328,7 @@ def run_one_task(task):
             return {
                 "file": file_name,
                 "target": target_option,
-                "C": C_FIXED,
+                "C": c,
                 "max_iter": hp["max_iter"],
                 "tol": hp["tol"],
                 "class_weight": class_weight if class_weight is not None else "none",
@@ -363,7 +363,7 @@ def run_one_task(task):
         return {
             "file": file_name,
             "target": target_option,
-            "C": C_FIXED,
+            "C": c,
             "max_iter": hp["max_iter"],
             "tol": hp["tol"],
             "class_weight": class_weight if class_weight is not None else "none",
@@ -382,7 +382,7 @@ def run_one_task(task):
         return {
             "file": file_name,
             "target": target_option,
-            "C": C_FIXED,
+            "C": c,
             "max_iter": hp.get("max_iter"),
             "tol": hp.get("tol"),
             "class_weight": class_weight if class_weight is not None else "none",
@@ -408,9 +408,10 @@ def main():
     tasks = []
     for p in paths:
         for target in TARGET_OPTIONS:
-            for hp in HP_SCHEDULE:
-                for cw in CLASS_WEIGHTS:
-                    tasks.append((p, target, hp, cw))
+            for c in Cs:
+                for hp in HP_SCHEDULE:
+                    for cw in CLASS_WEIGHTS:
+                        tasks.append((p, target, c, hp, cw))
     print(f"Total tasks: {len(tasks)}")
 
     max_workers = min(os.cpu_count() or 2, 8)  # cap to avoid memory pressure

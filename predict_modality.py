@@ -70,12 +70,11 @@ MULTI_CLASS = "auto"           # Quiet deprecation; >=1.7 will default to multin
 
 # Minimal hyperparameter schedule
 HP_SCHEDULE = [
-    {"max_iter": 200, "tol": 1e-3},
-    {"max_iter": 500, "tol": 1e-4},
     {"max_iter": 1000, "tol": 1e-4},
-    {"max_iter": 1000, "tol": 1e-5},
-    {"max_iter": 2000, "tol": 1e-5},
-    {"max_iter": 2000, "tol": 1e-6},
+    {"max_iter": 2000, "tol": 1e-4},
+    {"max_iter": 3000, "tol": 1e-4},
+    {"max_iter": 4000, "tol": 1e-4},
+    {"max_iter": 5000, "tol": 1e-4},
 ]
 CLASS_WEIGHTS = [None]   # try with/without balancing
 

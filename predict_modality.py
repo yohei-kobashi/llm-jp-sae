@@ -178,46 +178,50 @@ def sentence_pool_sum_modal_only(tokens, indices_per_token, acts_per_token, targ
     nz = np.nonzero(cnt)[0]
     return csr_matrix((cnt[nz], (np.zeros_like(nz), nz)), shape=(1, D), dtype=np.float32)
 
-
 def build_X_y(df):
-    """
-    Build the CSR feature matrix X and label vector y from a DataFrame with columns:
-      - Modal_Verb, sae_tokens, sae_latent_indices, sae_latent_acts
-    Returns: X (csr_matrix), y (np.ndarray), D (int), label_encoder (LabelEncoder)
-    """
-    # Ensure label is string (avoid bytes vs str comparisons)
+    """Build the CSR feature matrix X and label vector y from a DataFrame."""
+    print("  [build_X_y] Start")
+    # Ensure label is string
     modal_str = df["Modal_Verb"].astype(str)
     le = LabelEncoder()
     y = le.fit_transform(modal_str)
+    print(f"  [build_X_y] Modal_Verb classes: {list(le.classes_)}")
 
-    # Estimate SAE dictionary size from nested indices
+    # Estimate SAE dictionary size
     D = max_idx_from_nested(df["sae_latent_indices"]) + 1
+    print(f"  [build_X_y] Estimated dictionary size D={D}")
     if D <= 0:
         raise ValueError("Dictionary size D could not be estimated (no non-empty activations).")
 
     # Build CSR rows
     rows = []
+    print(f"  [build_X_y] Building rows, total samples={len(df)} ...")
     if USE_MODAL_TOKEN_ONLY:
-        for tokens, idxs, vals, modal in zip(
-            df["sae_tokens"], df["sae_latent_indices"], df["sae_latent_acts"], modal_str
+        for i, (tokens, idxs, vals, modal) in enumerate(
+            zip(df["sae_tokens"], df["sae_latent_indices"], df["sae_latent_acts"], modal_str)
         ):
+            if i % 500 == 0:
+                print(f"    processed {i} rows...")
             row = sentence_pool_sum_modal_only(tokens, idxs, vals, target_modal=str(modal), D=D)
             rows.append(row)
     else:
-        for idxs, vals in zip(df["sae_latent_indices"], df["sae_latent_acts"]):
+        for i, (idxs, vals) in enumerate(zip(df["sae_latent_indices"], df["sae_latent_acts"])):
+            if i % 500 == 0:
+                print(f"    processed {i} rows...")
             row = sentence_pool_sum(indices_per_token=idxs, acts_per_token=vals, D=D)
             rows.append(row)
 
     X = vstack(rows, format="csr")
+    print(f"  [build_X_y] Finished building X with shape {X.shape}, nnz={X.nnz}")
     return X, y, D, le
 
 
 def run_one_file(path):
-    """
-    Load a Parquet file, build X/y, train/test split, fit multinomial L1 logistic regression,
-    and return a result dict with metadata and accuracies.
-    """
+    """Process one Parquet file with debug logs."""
+    print(f"\n[run_one_file] Processing {path}")
     df = pd.read_parquet(path)
+    print(f"  Rows loaded: {len(df)}")
+
     required = ["Modal_Verb", "sae_tokens", "sae_latent_indices", "sae_latent_acts"]
     for col in required:
         if col not in df.columns:
@@ -225,8 +229,9 @@ def run_one_file(path):
 
     X, y, D, le = build_X_y(df)
 
-    # Skip if only one class is present
     unique_classes = np.unique(y)
+    print(f"  [run_one_file] #classes={len(unique_classes)}")
+
     if len(unique_classes) < 2:
         return {
             "file": os.path.basename(path),
@@ -238,10 +243,13 @@ def run_one_file(path):
             "note": "Skipped (only one class present)",
         }
 
+    print("  [run_one_file] Splitting train/test...")
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
+    print(f"  [run_one_file] Train shape={X_train.shape}, Test shape={X_test.shape}")
 
+    print("  [run_one_file] Training logistic regression...")
     clf = LogisticRegression(
         multi_class="multinomial",
         solver="saga",
@@ -250,10 +258,14 @@ def run_one_file(path):
         max_iter=MAX_ITER,
         n_jobs=-1,
         class_weight=CLASS_WEIGHT,
+        verbose=1,   # scikit-learn’s own progress log
     )
     clf.fit(X_train, y_train)
+    print("  [run_one_file] Training complete")
+
     train_acc = clf.score(X_train, y_train)
     test_acc = clf.score(X_test, y_test)
+    print(f"  [run_one_file] Train acc={train_acc:.3f}, Test acc={test_acc:.3f}")
 
     return {
         "file": os.path.basename(path),

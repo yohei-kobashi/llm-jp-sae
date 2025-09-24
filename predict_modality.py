@@ -273,12 +273,12 @@ def build_X_y(df, target_option):
     return X, y, D, le, len(df2), n_dropped, list(le.classes_)
 
 # ---------- Model helpers ----------
-def fit_logreg(X, y, C, tol, max_iter, class_weight):
+def fit_logreg(X, y, c, tol, max_iter, class_weight):
     """Fit multinomial logistic regression with L1; suppress ConvergenceWarning."""
     clf = LogisticRegression(
         solver=SOLVER,
         penalty=PENALTY,
-        C=C,
+        C=c,
         tol=tol,
         max_iter=max_iter,
         n_jobs=N_JOBS,
@@ -350,7 +350,7 @@ def run_one_task(task):
 
         # Fit
         t0 = time.time()
-        clf = fit_logreg(X_train, y_train, tol=hp["tol"], max_iter=hp["max_iter"], class_weight=class_weight)
+        clf = fit_logreg(X_train, y_train, c=c, tol=hp["tol"], max_iter=hp["max_iter"], class_weight=class_weight)
         fit_sec = time.time() - t0
 
         # Evaluate

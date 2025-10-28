@@ -3,7 +3,7 @@ predict_modality_parallel.py
 
 What this script does
 ---------------------
-- Loads all Parquet files under `modality_data/`
+- Loads all Parquet files under `data/`
 - For each file and each target label option:
     - Builds sparse features from SAE activations (token-pooled)
     - Filters labels: removes "unknown" (where applicable) and drops rare classes (n < 5)
@@ -51,7 +51,7 @@ from sklearn.exceptions import ConvergenceWarning
 # ======================
 # Configuration
 # ======================
-PARQUET_GLOB = "modality_data/*.parquet"
+PARQUET_GLOB = "data/*.parquet"
 RESULT_CSV = "results_modality_logreg_all_targets_min_tune_parallel.csv"
 
 # Train/test split

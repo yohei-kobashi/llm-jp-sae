@@ -1,21 +1,42 @@
 """
-Export SAE activations for the modality dataset.
+Export SAE activations for either:
 
-Usage example:
+1) modality CSVs with `Marked_Sentence_English` (markers like `*` removed), or
+2) generic CSVs with a raw sentence column (no preprocessing).
 
-    python3 modality_data/export_sae_activations.py \
-        --layers 12 13 --n_d 16 --k 32 --nl Scalar \
-        --ckpt 988240 --lr 1e-3 \
-        --label experiment1 \
-        --input-csv modality_data/qp_modality_list_v1.csv \
-        --output-dir modality_data
+Usage examples:
 
-The script loads the language model and trained sparse autoencoders, removes
-modal markers from `Marked_Sentence_English`, extracts latent activations for
-each requested layer, and exports the original CSV columns together with SAE
-features in layer-specific Parquet files. Pass `--label` when the SAE was
-trained with a label prefix so the script looks in the matching checkpoint
-directory and automatically appends the label to output filenames.
+  - Modality CSV (default mode):
+
+        python3 export_sae_activations.py \
+            --layers 12 13 --n_d 16 --k 32 --nl Scalar \
+            --ckpt 988240 --lr 1e-3 \
+            --label experiment1 \
+            --input-csv data/qp_modality_list_v1.csv \
+            --output-dir data
+
+    This removes `*` markers from `Marked_Sentence_English`, extracts SAE
+    activations, and writes Parquet files. It also adds
+    `Marked_Sentence_English_Unmarked` to outputs.
+
+  - Generic CSV (no modality markers, custom sentence column):
+
+        python3 export_sae_activations.py \
+            --no-modality \
+            --sentence-column sentence \
+            --input-csv data/simple.csv \
+            --layers 12 13 \
+            --output-dir outputs
+
+    This reads the `sentence` column as-is (no preprocessing) and exports SAE
+    activations. No modality-specific columns are added.
+
+The script loads the language model and trained sparse autoencoders, obtains
+latent activations for each requested layer, and exports the original CSV
+columns together with SAE features in layer-specific Parquet files. Pass
+`--label` when the SAE was trained with a label prefix so the script looks in
+the matching checkpoint directory and optionally appends the label to output
+filenames.
 """
 
 import argparse
@@ -159,7 +180,6 @@ def _extract_batch(
     sae,
     tokenizer,
     hook: SimpleHook,
-    layer: int,
     texts: Sequence[str],
     nl: str,
 ) -> List[Dict[str, Any]]:
@@ -170,7 +190,6 @@ def _extract_batch(
         sae: Sparse autoencoder that projects activations to latent space.
         tokenizer: Tokenizer aligned with `model`.
         hook: Previously registered hook capturing the hidden states.
-        layer: Layer index corresponding to the hook and SAE.
         texts: Batch of sentences (without markers) to process.
         nl: Normalisation strategy applied before feeding activations to the SAE.
 
@@ -244,7 +263,7 @@ def _collect_layer(
     layer: int,
     args: argparse.Namespace,
     base_df: "pd.DataFrame",
-    pairs: Sequence[Tuple[str, str]],
+    texts: Sequence[str],
     model,
     tokenizer,
     save_dir: str,
@@ -255,7 +274,7 @@ def _collect_layer(
         layer: Layer index to process.
         args: CLI arguments describing normalisation and batching behaviour.
         base_df: Original dataframe loaded from the CSV file.
-        pairs: Sequence of `(original_sentence, cleaned_sentence)` tuples.
+        texts: Cleaned or raw sentences to process (depending on modality flag).
         model: Language model loaded once for all layers.
         tokenizer: Tokeniser aligned with the language model.
         save_dir: Directory containing the SAE checkpoints.
@@ -269,21 +288,16 @@ def _collect_layer(
     hook = _build_hook(model, layer)
 
     aggregated: List[Dict[str, Any]] = []
-    for batch in _batched(pairs, args.batch_size):
-        originals, cleaned_batch = zip(*batch)
+    for batch in _batched(texts, args.batch_size):
         batch_records = _extract_batch(
             model=model,
             sae=sae,
             tokenizer=tokenizer,
             hook=hook,
-            layer=layer,
-            texts=cleaned_batch,
+            texts=batch,
             nl=args.nl,
         )
-        for original, clean, record in zip(originals, cleaned_batch, batch_records):
-            record["Marked_Sentence_English"] = original
-            record["Marked_Sentence_English_Unmarked"] = clean
-            aggregated.append(record)
+        aggregated.extend(batch_records)
 
     hook.hook.remove()
 
@@ -291,9 +305,6 @@ def _collect_layer(
         raise RuntimeError("Mismatch between input rows and collected records.")
 
     result_df = base_df.copy()
-    result_df["Marked_Sentence_English_Unmarked"] = [
-        rec["Marked_Sentence_English_Unmarked"] for rec in aggregated
-    ]
     result_df["sae_tokens"] = [rec["tokens"] for rec in aggregated]
     result_df["sae_latent_indices"] = [rec["latent_indices"] for rec in aggregated]
     result_df["sae_latent_acts"] = [rec["latent_acts"] for rec in aggregated]
@@ -321,12 +332,22 @@ def run(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     df = pd.read_csv(args.input_csv)
-    if "Marked_Sentence_English" not in df.columns:
-        raise KeyError("Column 'Marked_Sentence_English' not found in the CSV file.")
 
-    sentences = df["Marked_Sentence_English"].astype(str).tolist()
-    cleaned = [_remove_markers(text) for text in sentences]
-    pairs: List[Tuple[str, str]] = list(zip(sentences, cleaned))
+    if args.modality:
+        if "Marked_Sentence_English" not in df.columns:
+            raise KeyError(
+                "Column 'Marked_Sentence_English' not found in the CSV file (modality mode)."
+            )
+        sentences = df["Marked_Sentence_English"].astype(str).tolist()
+        texts = [_remove_markers(text) for text in sentences]
+        # Add unmarked column in modality mode so it gets saved with outputs
+        df["Marked_Sentence_English_Unmarked"] = texts
+    else:
+        if args.sentence_column not in df.columns:
+            raise KeyError(
+                f"Column '{args.sentence_column}' not found in the CSV file (generic mode)."
+            )
+        texts = df[args.sentence_column].astype(str).tolist()
 
     label_suffix = f"_{args.label}" if args.label else ""
     template_kwargs_base = {
@@ -339,7 +360,7 @@ def run(args: argparse.Namespace) -> None:
             layer=layer,
             args=args,
             base_df=df,
-            pairs=pairs,
+            texts=texts,
             model=model,
             tokenizer=tokenizer,
             save_dir=save_dir,
@@ -362,13 +383,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input-csv",
-        default="modality_data/qp_modality_list_v1.csv",
+        default="data/qp_modality_list_v1.csv",
         dest="input_csv",
         help="Path to the modality CSV file.",
     )
     parser.add_argument(
         "--output-dir",
-        default="modality_data",
+        default="data",
         dest="output_dir",
         help="Directory where layer-specific Parquet files will be saved.",
     )
@@ -423,6 +444,28 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional label prefix used during training to disambiguate outputs.",
+    )
+    # Modality vs generic input handling
+    parser.add_argument(
+        "--modality",
+        dest="modality",
+        action="store_true",
+        help=(
+            "Treat CSV as modality dataset with 'Marked_Sentence_English' and remove markers."
+        ),
+    )
+    parser.add_argument(
+        "--no-modality",
+        dest="modality",
+        action="store_false",
+        help="Treat CSV as generic; read sentences from --sentence-column with no preprocessing.",
+    )
+    parser.set_defaults(modality=True)
+    parser.add_argument(
+        "--sentence-column",
+        type=str,
+        default="sentence",
+        help="Column name that holds raw sentences in generic mode.",
     )
     return parser.parse_args()
 

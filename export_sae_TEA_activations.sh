@@ -13,8 +13,8 @@ module load python/3.10.16 cuda
 
 cd llm-jp-sae 
 source env_g/bin/activate
-python export_sae_activations.py --layers 0 1 2 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality
-python export_sae_activations.py --layers 3 4 5 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality
+# python export_sae_activations.py --layers 0 1 2 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality
+# python export_sae_activations.py --layers 3 4 5 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality
 python export_sae_activations.py --layers 6 7 8 9 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality
 python export_sae_activations.py --layers 10 11 12 13 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality
 python export_sae_activations.py --layers 14 15 16 17 --input-csv data/TEA_list.csv --output-template qp_TEA_sae{label_suffix}_layer{layer}.parquet --no-modality

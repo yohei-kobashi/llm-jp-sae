@@ -62,15 +62,18 @@ from sklearn.exceptions import ConvergenceWarning
 # ]
 PARQUET_GLOB = "data/TEA_data/*.parquet"
 RESULT_CSV = "results_entailment_logreg_all_targets_min_tune_parallel.csv"
+# All target options to run
 TARGET_OPTIONS = [
     "entailment"
 ]
-TARGET_OPTIONS = [
-    "tense",
-    "aspect"
-]
-PARQUET_GLOB = "data/tense_aspect_data/*.parquet"
-RESULT_CSV = "results_tense_aspect_logreg_all_targets_min_tune_parallel.csv"
+# PARQUET_GLOB = "data/tense_aspect_data/*.parquet"
+# RESULT_CSV = "results_tense_aspect_logreg_all_targets_min_tune_parallel.csv"
+# # All target options to run
+# TARGET_OPTIONS = [
+#     "tense",
+#     "aspect"
+# ]
+
 UNKNOWN_TOKEN = "unknown"      # case-insensitive
 
 # Train/test split

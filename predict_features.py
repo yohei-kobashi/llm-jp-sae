@@ -51,8 +51,27 @@ from sklearn.exceptions import ConvergenceWarning
 # ======================
 # Configuration
 # ======================
-PARQUET_GLOB = "data/*.parquet"
-RESULT_CSV = "results_modality_logreg_all_targets_min_tune_parallel.csv"
+# PARQUET_GLOB = "data/*.parquet"
+# RESULT_CSV = "results_modality_logreg_all_targets_min_tune_parallel.csv"
+# # All target options to run
+# TARGET_OPTIONS = [
+#     "Modal_Verb",
+#     "Palmer_Expected",
+#     "Quirk_Expected",
+#     ("Palmer_Expected", "Quirk_Expected"),
+# ]
+PARQUET_GLOB = "data/TEA_data/*.parquet"
+RESULT_CSV = "results_entailment_logreg_all_targets_min_tune_parallel.csv"
+TARGET_OPTIONS = [
+    "entailment"
+]
+TARGET_OPTIONS = [
+    "tense",
+    "aspect"
+]
+PARQUET_GLOB = "data/tense_aspect_data/*.parquet"
+RESULT_CSV = "results_tense_aspect_logreg_all_targets_min_tune_parallel.csv"
+UNKNOWN_TOKEN = "unknown"      # case-insensitive
 
 # Train/test split
 TEST_SIZE = 0.2
@@ -77,15 +96,6 @@ HP_SCHEDULE = [
     {"max_iter": 5000, "tol": 1e-4},
 ]
 CLASS_WEIGHTS = [None]   # try with/without balancing
-
-# All target options to run
-TARGET_OPTIONS = [
-    "modal_verb",
-    "palmer_expected",
-    "quirk_expected",
-    "palmer_quirk_pair",
-]
-UNKNOWN_TOKEN = "unknown"      # case-insensitive
 
 # Rare-class pruning threshold: drop classes with < MIN_CLASS_SAMPLES
 MIN_CLASS_SAMPLES = 5
@@ -193,47 +203,51 @@ def sentence_pool_sum_modal_only(tokens, indices_per_token, acts_per_token, targ
 def select_and_encode_labels(df, target_option):
     """
     Build a filtered DataFrame and a string label series based on `target_option`.
-    Steps:
-      - filter out 'unknown' where applicable
-      - drop rare classes with counts < MIN_CLASS_SAMPLES
+    Common steps for ALL options:
+      - Always filter out UNKNOWN_TOKEN (case/space-insensitive) and NaN
+      - If target_option is a list/tuple, require ALL selected columns to be known
+        and join them with '|' to form a single string label
+      - Drop rare classes with counts < MIN_CLASS_SAMPLES
     Returns: filtered_df, label_str_series, dropped_count, option_used
     """
-    option = target_option.lower().strip()
-
-    if option == "modal_verb":
-        label = df["Modal_Verb"].astype(str)
-        filt = pd.Series([True] * len(df), index=df.index)
-
-    elif option == "palmer_expected":
-        pal = df["Palmer_Expected"].astype(str)
-        keep = pal.str.lower().str.strip() != UNKNOWN_TOKEN
-        filt = keep.fillna(False)
-        label = pal[filt]
-
-    elif option == "quirk_expected":
-        quirk = df["Quirk_Expected"].astype(str)
-        keep = quirk.str.lower().str.strip() != UNKNOWN_TOKEN
-        filt = keep.fillna(False)
-        label = quirk[filt]
-
-    elif option == "palmer_quirk_pair":
-        pal = df["Palmer_Expected"].astype(str)
-        quirk = df["Quirk_Expected"].astype(str)
-        pal_ok = pal.str.lower().str.strip() != UNKNOWN_TOKEN
-        quirk_ok = quirk.str.lower().str.strip() != UNKNOWN_TOKEN
-        keep = pal_ok & quirk_ok
-        filt = keep.fillna(False)
-        label = (pal[filt].str.strip() + "|" + quirk[filt].str.strip())
-
+    # Normalize target_option
+    if isinstance(target_option, (list, tuple)):
+        cols = list(target_option)
+        option_used = tuple(cols)
     else:
-        raise ValueError(f"Unknown TARGET_OPTION: {target_option}")
+        cols = [str(target_option)]
+        option_used = cols[0]
 
-    # Filter "unknown"
-    filtered_df = df[filt].reset_index(drop=True)
-    label = label.reset_index(drop=True)
-    dropped = int((~filt).sum())
+    # Check column existence
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Columns not found in df: {missing}")
 
-    # Drop rare classes
+    # Convert all selected columns to string
+    str_df = df[cols].astype(str)
+
+    # Filter out unknown or NaN values (case- and space-insensitive)
+    # Because astype(str) converts NaN -> "nan", we also check original NaNs
+    notna_all = df[cols].notna().all(axis=1)
+
+    normalized = str_df.apply(lambda s: s.str.lower().str.strip())
+    is_unknown = normalized.eq(UNKNOWN_TOKEN)
+    keep_mask = notna_all & (~is_unknown.any(axis=1))  # keep only rows where all columns are valid
+
+    # Filter dataframe and count dropped samples
+    filtered_df = df[keep_mask].reset_index(drop=True)
+    dropped = int((~keep_mask).sum())
+
+    # Build label series
+    # - For a single column: use it directly
+    # - For multiple columns: join values with '|'
+    trimmed = str_df.apply(lambda s: s.str.strip())
+    if len(cols) == 1:
+        label = trimmed.loc[keep_mask, cols[0]].reset_index(drop=True)
+    else:
+        label = trimmed.loc[keep_mask, cols].agg("|".join, axis=1).reset_index(drop=True)
+
+    # Drop rare classes with counts < MIN_CLASS_SAMPLES
     counts = label.value_counts()
     valid = counts[counts >= MIN_CLASS_SAMPLES].index
     keep_final = label.isin(valid)
@@ -243,13 +257,14 @@ def select_and_encode_labels(df, target_option):
     label = label[keep_final].reset_index(drop=True)
     dropped += dropped_small
 
-    return filtered_df, label, dropped, option
+    return filtered_df, label, dropped, option_used
 
 def build_X_y(df, target_option):
     """
     Returns: X (csr), y (ndarray), D (int), label_encoder, n_used, n_dropped, classes(list[str])
     """
-    df2, label_str, n_dropped, option_used = select_and_encode_labels(df, target_option)
+    
+    df2, label_str, n_dropped, _ = select_and_encode_labels(df, target_option)
     le = LabelEncoder()
     y = le.fit_transform(label_str.astype(str))
 
@@ -311,9 +326,7 @@ def run_one_task(task):
         df = pd.read_parquet(path)
 
         required = [
-            "Modal_Verb",
-            "Palmer_Expected",
-            "Quirk_Expected",
+            target_option,
             "sae_tokens",
             "sae_latent_indices",
             "sae_latent_acts",

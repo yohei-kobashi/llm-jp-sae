@@ -47,13 +47,14 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> 
 
 
 def train(
-    dl_train, dl_val, train_cfg, model_dir, layers, n_d, k, nl, ckpt, lr, save_dir
+    dl_train, dl_val, train_cfg, model_dir, layers, n_d, k, nl, ckpt, lr, save_dir, hf_token=None
 ):
     # load the language model to extract activations
     model = AutoModelForCausalLM.from_pretrained(
         # os.path.join(model_dir, f"iter_{str(ckpt).zfill(7)}"),
         model_dir,
         torch_dtype=torch.bfloat16,
+        token=hf_token,
     ).to(MODEL_DEVICE)
     model.eval()
 
@@ -192,6 +193,15 @@ def main():
         type=str,
         default=None,
     )
+    parser.add_argument(
+        "--hf_token",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face read token. If omitted, uses HF_TOKEN or "
+            "HUGGINGFACE_HUB_TOKEN environment variable."
+        ),
+    )
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
@@ -223,6 +233,17 @@ def main():
     model_name_or_dir = usr_cfg.model_name_or_dir
     if args.model_name_or_dir:
         model_name_or_dir = args.model_name_or_dir
+    hf_token = (
+        args.hf_token
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    )
+    requires_hf_auth = model_name_or_dir.startswith("meta-llama/")
+    if requires_hf_auth and not hf_token:
+        raise ValueError(
+            "This model requires a Hugging Face read token. Set --hf_token or "
+            "HF_TOKEN/HUGGINGFACE_HUB_TOKEN."
+        )
 
     print(
         f"Layers: {args.layers}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
@@ -259,6 +280,7 @@ def main():
         args.ckpt,
         args.lr,
         save_dir,
+        hf_token,
     )
 
 if __name__ == "__main__":

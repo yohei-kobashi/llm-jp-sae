@@ -256,6 +256,15 @@ def main() -> None:
         type=float,
         default=None,
     )
+    parser.add_argument(
+        "--hf_token",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face read token. If omitted, uses HF_TOKEN or "
+            "HUGGINGFACE_HUB_TOKEN environment variable."
+        ),
+    )
     args = parser.parse_args()
     
     # RNG reproducibility
@@ -291,7 +300,22 @@ def main() -> None:
         print(f"  warp_html sample: {len(warp_texts)} lines")
 
     # 2) TOKENISER -----------------------------------------------------------
-    tokenizer = AutoTokenizer.from_pretrained(usr_cfg.model_name_or_dir)
+    hf_token = (
+        args.hf_token
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    )
+    requires_hf_auth = usr_cfg.model_name_or_dir.startswith("meta-llama/")
+    if requires_hf_auth and not hf_token:
+        raise ValueError(
+            "This model requires a Hugging Face read token. Set --hf_token or "
+            "HF_TOKEN/HUGGINGFACE_HUB_TOKEN."
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        usr_cfg.model_name_or_dir,
+        token=hf_token,
+    )
     if tokenizer.pad_token is None:
         raise ValueError("Tokenizer has no pad token.")
     pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)

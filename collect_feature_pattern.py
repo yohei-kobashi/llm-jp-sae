@@ -18,7 +18,27 @@ import time
 import pickle
 import numpy as np
 
+"""
+Usage:
+    python collect_feature_pattern.py --layers 12 13 --ckpt 988240 --n_d 16 --k 32 --nl Scalar --top_n 30
+
+This script runs a two-pass pipeline to collect high-activation token patterns
+for sparse autoencoder (SAE) features on a causal LM:
+  1) Pass 1 scans the dataset to find the top-N sample indices per feature using
+     only sparse activations (fast, memory-light). Results are saved per layer.
+  2) Pass 2 replays only the needed samples, reconstructs activations for the
+     selected features, and writes token/activation pairs to temporary files.
+  3) Finalization deduplicates per-sample entries, normalizes activations, and
+     emits compact JSON files per feature. The step can resume from checkpoints
+     unless --no_skip is provided to force a full recompute.
+
+Key paths are derived from UsrConfig/TrainConfig/EvalConfig and the arguments;
+SAE weights must already exist under the computed save_dir. The script supports
+resume/retry behavior via pass2_resume.json and pass2_progress_layer*.jsonl.
+"""
+
 def _read_proc_rss_kb() -> Optional[int]:
+    """Return current RSS from /proc/self/status in kB, or None if unavailable."""
     try:
         with open('/proc/self/status', 'r') as f:
             for line in f:
@@ -31,6 +51,7 @@ def _read_proc_rss_kb() -> Optional[int]:
     return None
 
 def _get_rss_bytes() -> Optional[int]:
+    """Return process RSS in bytes using psutil when possible, otherwise /proc."""
     # Try psutil first if available
     try:
         import psutil  # type: ignore
@@ -41,6 +62,7 @@ def _get_rss_bytes() -> Optional[int]:
         return kb * 1024 if kb is not None else None
 
 def _bytes_to_str(n: Optional[int]) -> str:
+    """Format a byte count into a human-readable string (B/KB/MB/GB/TB/PB)."""
     if n is None:
         return "?"
     for unit in ['B','KB','MB','GB','TB']:
@@ -50,6 +72,7 @@ def _bytes_to_str(n: Optional[int]) -> str:
     return f"{n:.1f}PB"
 
 def _print_mem(tag: str):
+    """Print current CPU/GPU memory usage with a tag for debugging."""
     cpu = _bytes_to_str(_get_rss_bytes())
     if torch.cuda.is_available():
         try:
@@ -64,6 +87,7 @@ def _print_mem(tag: str):
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
 
 def _log(msg: str):
+    """Write a log line via tqdm when available, otherwise stdout."""
     try:
         tqdm.write(msg)
     except Exception:
@@ -90,6 +114,7 @@ except Exception:
 
 # --- Binary intermediate record helpers ---
 def _bin_append_record(path: str, obj: dict):
+    """Append a single length-prefixed, pickled dict to a binary file."""
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     # Write length-prefixed record to allow streaming append
     with open(path, "ab") as f:
@@ -98,6 +123,7 @@ def _bin_append_record(path: str, obj: dict):
 
 
 def _bin_iter_records(path: str):
+    """Yield pickled dicts from a length-prefixed binary file."""
     with open(path, "rb") as f:
         while True:
             hdr = f.read(8)
@@ -111,6 +137,7 @@ def _bin_iter_records(path: str):
 
 
 def _bin_append_many(path: str, objs: List[dict]):
+    """Append many pickled dicts to a binary file in one open/close cycle."""
     if not objs:
         return
     with open(path, "ab") as f:
@@ -121,6 +148,7 @@ def _bin_append_many(path: str, objs: List[dict]):
 
 
 def _finalize_one_task(args):
+    """Worker helper for finalizing a single feature BIN into JSON output."""
     layer, feat_id, tmp_dir, features_dir, fmt = args
     tmp_fp = os.path.join(tmp_dir, f"{feat_id}.bin")
     out_fp = os.path.join(features_dir, f"{feat_id}.json")
@@ -217,6 +245,13 @@ def collect_feature_pattern_impl(
     no_skip: bool = False,
     final_format: str = "pairs",
 ):
+    """
+    Run the end-to-end feature pattern collection pipeline:
+      - Pass1: find top-N sample indices per feature from sparse SAE outputs.
+      - Pass2: reconstruct activations for only the selected (feature, sample) pairs.
+      - Finalize: deduplicate, normalize, and write per-feature JSON artifacts.
+    Supports resume via saved progress files unless no_skip forces a fresh run.
+    """
     # Load model and tokenizer once
     if DEBUG:
         _log("[INIT] Loading model and tokenizer...")
@@ -246,6 +281,7 @@ def collect_feature_pattern_impl(
     heaps_per_layer: Dict[int, List[List[Tuple[float, int, ActivationRecord]]]] = {}
     # Pass1 resume support
     def _pass1_path(layer: int) -> str:
+        """Return path to the cached pass1 selection JSON for a layer."""
         return os.path.join(save_dir, f"pass1_selected_layer{layer}.json")
     selected_per_layer: Dict[int, Dict[int, List[int]]] = {}
     pass1_layers: List[int] = []
@@ -493,6 +529,7 @@ def collect_feature_pattern_impl(
 
     # Build and open streaming index: sidx -> [fids]
     def _by_sample_path(layer: int) -> str:
+        """Return path to the per-layer sample-to-features index JSONL."""
         return os.path.join(save_dir, f"pass1_selected_by_sample_layer{layer}.jsonl")
 
     for layer in layers:
@@ -712,6 +749,7 @@ def collect_feature_pattern_impl(
 
     # Finalize: assemble per-feature JSONs and remove tmp, in parallel
     def _finalize_one(args):
+        """Process-pool helper: convert one tmp BIN into final JSON and cleanup."""
         layer, feat_id, tmp_dir, features_dir, fmt = args
         tmp_fp = os.path.join(tmp_dir, f"{feat_id}.bin")
         out_fp = os.path.join(features_dir, f"{feat_id}.json")
@@ -837,6 +875,7 @@ def collect_feature_pattern_impl(
 
 
 def _format_activation_record(activation_record, max_act):
+    """Convert one ActivationRecord to token/value pairs normalized to 0-10."""
     tokens = activation_record.tokens
     acts = activation_record.act_values
     token_act_list = []
@@ -852,6 +891,7 @@ def _format_activation_record(activation_record, max_act):
 
 
 def format_example(activation_records, max_act):
+    """Format a list of ActivationRecord objects for JSON serialization."""
     token_act_list = []
     for idx_sample, activation_record in enumerate(activation_records):
         token_act = _format_activation_record(activation_record, max_act)
@@ -864,6 +904,7 @@ def save_token_act(
     feature_record,
     features_dir,
 ):
+    """Persist token/activation pairs for a FeatureRecord to JSON."""
     len_data = len(feature_record.act_patterns)
     max_act = max(
         [max(feature_record.act_patterns[i].act_values) for i in range(len_data)]
@@ -885,6 +926,7 @@ def save_token_act(
 
 
 def main():
+    """CLI entry point that wires configs, loads data, and runs the pipeline."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=int, default=988240, help="Checkpoint (for save_dir naming)")
     parser.add_argument(

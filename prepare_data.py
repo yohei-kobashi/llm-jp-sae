@@ -119,15 +119,18 @@ def _load_or_sample(lines: List[str], rate: float, cache_path: Path) -> List[str
 # TOKENISATION HELPERS --------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-def batch_tokenize(tokenizer: AutoTokenizer, texts: List[str], max_length: int, pad_id: int) -> torch.Tensor:
-    ids = tokenizer(
+def batch_tokenize(tokenizer: AutoTokenizer, texts: List[str], max_length: int) -> torch.Tensor:
+    enc = tokenizer(
         texts,
         padding="max_length",
         truncation=True,
         max_length=max_length,
         return_tensors="pt",
-    )["input_ids"]
-    return ids[ids.ne(pad_id).all(dim=1)]
+    )
+    ids = enc["input_ids"]
+    attn = enc["attention_mask"]
+    # Keep only rows that fill max_length with no padding.
+    return ids[attn.all(dim=1)]
 
 
 def _token_file(name: str, save_dir: Path) -> Path:
@@ -139,7 +142,6 @@ def tokenize_corpus(
     tokenizer: AutoTokenizer,
     corpus: List[str],
     seq_len: int,
-    pad_id: int,
     batch_size: int,
     save_dir: Path,
 ) -> torch.Tensor:
@@ -164,7 +166,7 @@ def tokenize_corpus(
     pbar = tqdm(range(processed, n_docs, batch_size), desc=f"Tokenising {name}")
     for start in pbar:
         end = min(start + batch_size, n_docs)
-        tok = batch_tokenize(tokenizer, corpus[start:end], per_doc, pad_id)
+        tok = batch_tokenize(tokenizer, corpus[start:end], per_doc)
         buf[processed : processed + tok.size(0)] = tok
         processed += tok.size(0)
         pbar.set_postfix({"docs": processed, "%": f"{processed/n_docs:.1%}"})
@@ -317,8 +319,12 @@ def main() -> None:
         token=hf_token,
     )
     if tokenizer.pad_token is None:
-        raise ValueError("Tokenizer has no pad token.")
-    pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+            print("  ! tokenizer.pad_token is unset; using eos_token as pad_token")
+        else:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            print("  ! tokenizer.pad_token is unset; added [PAD] token")
 
     # 3) TOKENISATION (resumable) -------------------------------------------
     dolma_name = "dolma"
@@ -328,11 +334,11 @@ def main() -> None:
         warp_name = data_cfg.label + warp_name
     if data_cfg.dolma_sample_rate:
         dolma_tok = tokenize_corpus(
-            dolma_name, tokenizer, dolma_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
+            dolma_name, tokenizer, dolma_texts, data_cfg.seq_len, data_cfg.batch_size_tokenizer, save_dir
         )
     if data_cfg.warp_sample_rate:
         warp_tok = tokenize_corpus(
-            warp_name, tokenizer, warp_texts, data_cfg.seq_len, pad_id, data_cfg.batch_size_tokenizer, save_dir
+            warp_name, tokenizer, warp_texts, data_cfg.seq_len, data_cfg.batch_size_tokenizer, save_dir
         )
 
     # 4) COMBINE & SPLIT -----------------------------------------------------

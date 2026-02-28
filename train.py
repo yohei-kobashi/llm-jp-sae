@@ -58,13 +58,26 @@ def train(
     ).to(MODEL_DEVICE)
     model.eval()
 
+    # Infer SAE input width from the loaded LM (e.g. 2048 for LLM-jp, 1536 for Qwen2.5-1.5B).
+    d_in = (
+        getattr(model.config, "hidden_size", None)
+        or getattr(model.config, "n_embd", None)
+        or getattr(model.config, "d_model", None)
+    )
+    if d_in is None:
+        try:
+            d_in = int(model.model.embed_tokens.weight.shape[1])
+        except Exception as e:
+            raise ValueError("Could not infer hidden width from model config/embeddings.") from e
+    d_in = int(d_in)
+
     # initialize the sparse autoencoders
     saes = {}
     optims = {}
     hooks = {}
     for layer in layers:
         # SAE
-        cfg = SaeConfig(expansion_factor=n_d, k=k)
+        cfg = SaeConfig(d_in=d_in, expansion_factor=n_d, k=k)
         sae = SparseAutoEncoder(cfg).to(SAE_DEVICE)
         saes[layer] = sae
         optims[layer] = torch.optim.Adam(sae.parameters(), lr=lr, eps=6.25e-10)

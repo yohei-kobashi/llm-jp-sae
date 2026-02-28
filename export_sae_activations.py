@@ -133,8 +133,6 @@ def _load_sae(layer: int, args: argparse.Namespace, save_dir: str) -> SparseAuto
     Raises:
         FileNotFoundError: If the checkpoint for the requested layer is missing.
     """
-    cfg = SaeConfig(expansion_factor=args.n_d, k=args.k)
-    sae = SparseAutoEncoder(cfg).to(SAE_DEVICE)
     weight_name = f"sae_layer{layer}.pth"
     weight_path = os.path.join(save_dir, weight_name)
     if not os.path.isfile(weight_path):
@@ -142,6 +140,15 @@ def _load_sae(layer: int, args: argparse.Namespace, save_dir: str) -> SparseAuto
             f"SAE checkpoint not found: {weight_path}. Make sure train.py was run."
         )
     state = torch.load(weight_path, map_location=SAE_DEVICE)
+    # Infer d_in from checkpoint so non-2048 models (e.g., Qwen) load correctly.
+    if "b_dec" in state:
+        d_in = int(state["b_dec"].shape[0])
+    elif "encoder.weight" in state:
+        d_in = int(state["encoder.weight"].shape[1])
+    else:
+        raise KeyError(f"Cannot infer SAE input width from checkpoint: {weight_path}")
+    cfg = SaeConfig(d_in=d_in, expansion_factor=args.n_d, k=args.k)
+    sae = SparseAutoEncoder(cfg).to(SAE_DEVICE)
     sae.load_state_dict(state)
     sae.eval()
     return sae

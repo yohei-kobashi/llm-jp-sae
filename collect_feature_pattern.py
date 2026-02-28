@@ -400,13 +400,21 @@ def collect_feature_pattern_impl(
         # SAE per layer
         if DEBUG:
             _log(f"[INIT] Loading SAE for layer {layer}...")
-        sae_config = SaeConfig(expansion_factor=n_d, k=k)
-        sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
-        sae.eval()
         sae_path = os.path.join(save_dir, f"sae_layer{layer}.pth")
         if not os.path.exists(sae_path):
             raise FileNotFoundError(f"SAE weight not found for layer {layer}: {sae_path}")
-        sae.load_state_dict(torch.load(sae_path))
+        state = torch.load(sae_path, map_location=SAE_DEVICE)
+        # Infer d_in from checkpoint so non-2048 models (e.g., Qwen) load correctly.
+        if "b_dec" in state:
+            d_in = int(state["b_dec"].shape[0])
+        elif "encoder.weight" in state:
+            d_in = int(state["encoder.weight"].shape[1])
+        else:
+            raise KeyError(f"Cannot infer SAE input width from checkpoint: {sae_path}")
+        sae_config = SaeConfig(d_in=d_in, expansion_factor=n_d, k=k)
+        sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
+        sae.eval()
+        sae.load_state_dict(state)
         saes[layer] = sae
         num_features_per_layer[layer] = sae.num_latents
         if DEBUG:

@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from tqdm import tqdm
+from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, get_constant_schedule_with_warmup
 
 from config import SaeConfig, TrainConfig, UsrConfig, return_save_dir
@@ -47,7 +48,19 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> 
 
 
 def train(
-    dl_train, dl_val, train_cfg, model_dir, layers, n_d, k, nl, ckpt, lr, save_dir, hf_token=None
+    dl_train,
+    dl_val,
+    train_cfg,
+    model_dir,
+    layers,
+    n_d,
+    k,
+    nl,
+    ckpt,
+    lr,
+    save_dir,
+    hf_token=None,
+    local_files_only=False,
 ):
     # load the language model to extract activations
     model = AutoModelForCausalLM.from_pretrained(
@@ -55,6 +68,7 @@ def train(
         model_dir,
         torch_dtype=torch.bfloat16,
         token=hf_token,
+        local_files_only=local_files_only,
     ).to(MODEL_DEVICE)
     model.eval()
 
@@ -215,6 +229,20 @@ def main():
             "HUGGINGFACE_HUB_TOKEN environment variable."
         ),
     )
+    parser.add_argument(
+        "--prefetch_model",
+        action="store_true",
+        help=(
+            "Pre-download the Hugging Face model with snapshot_download() and then "
+            "load from local path. Useful when direct LFS/CDN download is unstable."
+        ),
+    )
+    parser.add_argument(
+        "--hf_max_workers",
+        type=int,
+        default=1,
+        help="max_workers for Hugging Face snapshot_download (used with --prefetch_model)",
+    )
     args = parser.parse_args()
 
     usr_cfg = UsrConfig()
@@ -258,6 +286,21 @@ def main():
             "HF_TOKEN/HUGGINGFACE_HUB_TOKEN."
         )
 
+    if args.prefetch_model:
+        # Download once (resume enabled), then force local loading to avoid
+        # hanging direct downloads during from_pretrained.
+        print(
+            "Prefetching model snapshot from Hugging Face "
+            f"(max_workers={args.hf_max_workers})..."
+        )
+        model_name_or_dir = snapshot_download(
+            repo_id=model_name_or_dir,
+            token=hf_token,
+            resume_download=True,
+            max_workers=max(1, int(args.hf_max_workers)),
+        )
+        print(f"Using local model snapshot: {model_name_or_dir}")
+
     print(
         f"Layers: {args.layers}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
     )
@@ -294,6 +337,7 @@ def main():
         args.lr,
         save_dir,
         hf_token,
+        args.prefetch_model,
     )
 
 if __name__ == "__main__":

@@ -29,11 +29,11 @@ source env_g/bin/activate
 # python train.py --layers 17 18 19 20 --label both_
 # python train.py --layers 21 22 23 24 --label both_
 # python train.py --layers 0 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B
-python train.py --layers 1 2 3 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B
-python train.py --layers 4 5 6 7 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B
-python train.py --layers 8 9 10 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B
-python train.py --layers 11 12 13 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B
-python train.py --layers 14 15 16 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B
+# python train.py --layers 1 2 3 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B --prefetch_model --hf_max_workers 1
+# python train.py --layers 4 5 6 7 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B --prefetch_model --hf_max_workers 1
+# python train.py --layers 8 9 10 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B --prefetch_model --hf_max_workers 1
+# python train.py --layers 11 12 13 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B --prefetch_model --hf_max_workers 1
+# python train.py --layers 14 15 16 --label llama3.2_ --model_name_or_dir meta-llama/Llama-3.2-1B --prefetch_model --hf_max_workers 1
 # python train.py --layers 0 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
 # python train.py --layers 1 2 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
 # python train.py --layers 3 4 5 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B

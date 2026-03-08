@@ -38,8 +38,8 @@ source env_g/bin/activate
 # python train.py --layers 1 2 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
 # python train.py --layers 3 4 5 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
 # python train.py --layers 6 7 8 9 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
-python train.py --layers 10 11 12 13 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
-python train.py --layers 14 15 16 17 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
-python train.py --layers 18 19 20 21 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
-python train.py --layers 22 23 24 25 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
-python train.py --layers 26 27 28 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
+# python train.py --layers 10 11 12 13 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
+# python train.py --layers 14 15 16 17 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
+# python train.py --layers 18 19 20 21 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
+# python train.py --layers 22 23 24 25 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B
+# python train.py --layers 26 27 28 --label qwen2.5_ --model_name_or_dir Qwen/Qwen2.5-1.5B

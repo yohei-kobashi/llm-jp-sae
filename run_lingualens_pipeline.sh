@@ -41,7 +41,7 @@ TARGET="will"
 MODEL_PATH="llm-jp/llm-jp-3-1.8b"
 # sae/n_d_16/k_32/nl_Scalar/ckpt_0988240/lr_0.001/sae_layer{}.pth
 SAE_PATH_TEMPLATE="sae/n_d_16/k_32/nl_Scalar/ckpt_0988240/lr_0.001/sae_layer{}.pth"
-LAYERS=""
+LAYERS="0,1,2,3"
 INPUT_JSONL="data/minimal_pairs_acceptability.jsonl"
 OUTPUT_ROOT="outputs/lingualens"
 TEST_RATIO="0.1"

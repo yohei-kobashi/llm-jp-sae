@@ -18,12 +18,144 @@ from transformers import AutoModelForCausalLM
 
 from config import SaeConfig
 from model import SimpleHook, SparseAutoEncoder, normalize_activation
-from LinguaLens.lingualens.analyzer import LinguisticAnalyzer
-from LinguaLens.lingualens.metrics import compute_layer_stats
-from LinguaLens.lingualens.utils import validate_layer_indices
+from LinguaLens.lingualens.metrics import compute_layer_stats, get_top_features_by_frc
+from LinguaLens.lingualens.utils import (
+    ProgressLogger,
+    load_text_data,
+    save_json_results,
+    setup_tokenizer,
+    get_available_device,
+    validate_layer_indices,
+)
 
 
-class TrainSaeLinguisticAnalyzer(LinguisticAnalyzer):
+class BaseTrainSaeLinguisticAnalyzer:
+    """
+    Minimal analyzer base that avoids OpenSAE imports.
+
+    This mirrors only the LinguaLens functionality needed by the local
+    train.py-compatible analyzer.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        sae_path_template: str,
+        device: Optional[str] = None,
+    ):
+        self.model_path = model_path
+        self.sae_path_template = sae_path_template
+        self.device = device or get_available_device()
+        self.tokenizer = setup_tokenizer(model_path)
+        self._model_cache: Dict[int, Any] = {}
+
+    def analyze_feature(
+        self,
+        feature_file: str,
+        layers: List[int],
+        top_k: int = 10,
+    ) -> Dict[str, Any]:
+        lines = load_text_data(feature_file)
+
+        results = {
+            "feature_file": feature_file,
+            "total_examples": len(lines),
+            "layers_analyzed": layers,
+            "top_k": top_k,
+            "layer_results": {},
+            "unified_results": [],
+        }
+
+        progress = ProgressLogger(len(layers), "Analyzing layers")
+
+        for layer_idx in layers:
+            try:
+                layer_stats = self._analyze_single_layer(lines, layer_idx)
+                if layer_stats:
+                    top_features = get_top_features_by_frc(layer_stats, top_k)
+                    results["layer_results"][layer_idx] = {
+                        "total_base_vectors": len(layer_stats),
+                        "top_features": top_features,
+                        "full_stats": layer_stats,
+                    }
+
+                    feature_name = os.path.splitext(os.path.basename(feature_file))[0]
+                    for base_vector, frc_score in top_features[:3]:
+                        stats = layer_stats[base_vector]
+                        results["unified_results"].append(
+                            {
+                                "feature": feature_name,
+                                "layer": layer_idx,
+                                "base_vector": int(base_vector),
+                                "ps": stats["ps"],
+                                "pn": stats["pn"],
+                                "frc": stats["frc"],
+                                "avg_max_activation": stats["avg_max_activation"],
+                            }
+                        )
+
+                progress.update()
+            except Exception as exc:
+                print(f"Error analyzing layer {layer_idx}: {exc}")
+                results["layer_results"][layer_idx] = {"error": str(exc)}
+                progress.update()
+
+        progress.finish()
+        return results
+
+    def batch_analyze_features(
+        self,
+        feature_files: List[str],
+        layers: List[int],
+        output_dir: str,
+        top_k: int = 10,
+    ) -> Dict[str, Any]:
+        os.makedirs(output_dir, exist_ok=True)
+
+        batch_results = {
+            "total_features": len(feature_files),
+            "layers_analyzed": layers,
+            "successful_analyses": 0,
+            "failed_analyses": 0,
+            "unified_results": [],
+            "feature_summaries": {},
+        }
+
+        progress = ProgressLogger(len(feature_files), "Batch analysis")
+
+        for feature_file in feature_files:
+            try:
+                feature_results = self.analyze_feature(feature_file, layers, top_k)
+                feature_name = os.path.splitext(os.path.basename(feature_file))[0]
+                output_file = os.path.join(output_dir, f"{feature_name}_analysis.json")
+                save_json_results(feature_results, output_file)
+
+                batch_results["unified_results"].extend(feature_results["unified_results"])
+                batch_results["feature_summaries"][feature_name] = {
+                    "total_examples": feature_results["total_examples"],
+                    "layers_completed": len(
+                        [
+                            l
+                            for l in layers
+                            if l in feature_results["layer_results"]
+                            and "error" not in feature_results["layer_results"][l]
+                        ]
+                    ),
+                }
+                batch_results["successful_analyses"] += 1
+            except Exception as exc:
+                print(f"Failed to analyze {feature_file}: {exc}")
+                batch_results["failed_analyses"] += 1
+            finally:
+                progress.update()
+
+        progress.finish()
+        summary_file = os.path.join(output_dir, "batch_summary.json")
+        save_json_results(batch_results, summary_file)
+        return batch_results
+
+
+class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
     """
     LinguisticAnalyzer compatible with train.py checkpoints.
 

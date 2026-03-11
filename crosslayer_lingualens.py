@@ -13,7 +13,6 @@ import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-import matplotlib.pyplot as plt
 import torch
 
 from analyzer_lingualens import TrainSaeLinguisticAnalyzer
@@ -236,6 +235,13 @@ class TrainSaeCrossLayerAnalyzer:
         output_path: str,
         metric: str = "frc",
     ) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "matplotlib is required only when --plot is used."
+            ) from exc
+
         plt.figure(figsize=(12, 8))
 
         evolution_data = evolution_results["evolution_data"]

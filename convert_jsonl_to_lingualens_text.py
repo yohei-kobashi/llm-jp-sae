@@ -47,6 +47,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--test-output",
+        default="data/minimal_pairs_test.txt",
+        help="Output test JSONL path (default: data/minimal_pairs_test.txt)",
+    )
+    parser.add_argument(
+        "--test-output-jsonl",
         default="data/minimal_pairs_test.jsonl",
         help="Output test JSONL path (default: data/minimal_pairs_test.jsonl)",
     )
@@ -75,6 +80,7 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.test_output) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(args.test_output_jsonl) or ".", exist_ok=True)
 
     selected_rows: list[tuple[str, str, str, dict]] = []
     with open(args.input, "r", encoding="utf-8", newline="") as f_in:
@@ -100,9 +106,11 @@ def main() -> None:
             f_out.write(f"{original}\n")
             f_out.write(f"{minimal_pair}\n")
 
-    with open(args.test_output, "w", encoding="utf-8") as f_test:
-        for raw, _, _, _ in test_rows:
-            f_test.write(raw + "\n")
+    with open(args.test_output, "w", encoding="utf-8") as f_test, open(args.test_output_jsonl, "w", encoding="utf-8") as f_test_jsonl:
+        for raw, original, minimal_pair, _ in test_rows:
+            f_test.write(f"{original}\n")
+            f_test.write(f"{minimal_pair}\n")
+            f_test_jsonl.write(raw + "\n")
 
     print(
         "Done.\n"

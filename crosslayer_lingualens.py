@@ -281,14 +281,58 @@ def _parse_torch_dtype(dtype_name: str) -> torch.dtype:
     return mapping[dtype_name]
 
 
+def _extract_layer_candidates(results: Dict[str, Any], layers: List[int]) -> Dict[str, Any]:
+    layer_results = results.get("base_results", {}).get("layer_results", {})
+    candidates: Dict[str, Any] = {
+        "feature_file": results.get("feature_file"),
+        "layers": layers,
+        "layer_candidates": {},
+    }
+
+    for layer in layers:
+        result = layer_results.get(layer, layer_results.get(str(layer), {}))
+        top_features = result.get("top_features", [])
+        if not top_features:
+            candidates["layer_candidates"][str(layer)] = {
+                "status": "missing_top_features",
+            }
+            continue
+
+        base_vector, frc = top_features[0]
+        candidates["layer_candidates"][str(layer)] = {
+            "status": "ready",
+            "layer_idx": int(layer),
+            "base_vector": int(base_vector),
+            "frc": float(frc),
+        }
+
+    return candidates
+
+
+def _save_layer_candidates(
+    results: Dict[str, Any],
+    layers: List[int],
+    output_path: str,
+) -> None:
+    candidates = _extract_layer_candidates(results, layers)
+    save_json_results(candidates, output_path)
+    print(f"Saved layer candidates: {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cross-layer analysis for train.py SAE checkpoints."
     )
-    parser.add_argument("--model-path", required=True, help="Path or HF name of the base LLM.")
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        default="llm-jp/llm-jp-3-1.8b",
+        help="Path or HF name of the base LLM."
+    )
     parser.add_argument(
         "--sae-path-template",
         required=True,
+        default="sae/n_d_16/k_32/nl_Scalar/ckpt_0988240/lr_0.001/sae_layer{}.pth",
         help="SAE checkpoint template, e.g. /path/to/sae_layer{}.pth",
     )
     parser.add_argument(
@@ -337,6 +381,16 @@ def main() -> None:
         action="store_true",
         help="If set, save an evolution plot for single feature mode.",
     )
+    parser.add_argument(
+        "--export-layer-candidates",
+        action="store_true",
+        help="If set in single feature mode, save each layer's top base vector as JSON.",
+    )
+    parser.add_argument(
+        "--layer-candidates-output",
+        default=None,
+        help="Optional path for layer-candidate JSON. Default: <output-dir>/<feature>_layer_candidates.json",
+    )
 
     args = parser.parse_args()
     if not args.feature_file and not args.feature_files:
@@ -366,6 +420,12 @@ def main() -> None:
             output_json = os.path.join(args.output_dir, f"{feature_name}_evolution.json")
             save_json_results(results, output_json)
             print(f"Saved evolution result: {output_json}")
+
+            if args.export_layer_candidates:
+                candidates_output = args.layer_candidates_output or os.path.join(
+                    args.output_dir, f"{feature_name}_layer_candidates.json"
+                )
+                _save_layer_candidates(results, layers, candidates_output)
 
             if args.plot:
                 plot_path = os.path.join(

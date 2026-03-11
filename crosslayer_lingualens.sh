@@ -1,0 +1,1 @@
+python crosslayer_lingualens.py --layers 0,1,2,3 --feature-file data/minimal_pairs.txt 

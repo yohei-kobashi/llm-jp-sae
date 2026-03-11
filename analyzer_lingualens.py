@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -68,7 +69,12 @@ class BaseTrainSaeLinguisticAnalyzer:
 
         progress = ProgressLogger(len(layers), "Analyzing layers")
 
-        for layer_idx in layers:
+        for layer_position, layer_idx in enumerate(layers, start=1):
+            print(
+                f"[layer {layer_position}/{len(layers)}] start: "
+                f"layer={layer_idx}, top_k={top_k}"
+            )
+            layer_start = time.perf_counter()
             try:
                 layer_stats = self._analyze_single_layer(lines, layer_idx)
                 if layer_stats:
@@ -94,6 +100,18 @@ class BaseTrainSaeLinguisticAnalyzer:
                             }
                         )
 
+                    top_frc = float(top_features[0][1]) if top_features else float("nan")
+                    print(
+                        f"[layer {layer_position}/{len(layers)}] done: "
+                        f"layer={layer_idx}, base_vectors={len(layer_stats)}, "
+                        f"top_frc={top_frc:.4f}, elapsed={time.perf_counter() - layer_start:.1f}s"
+                    )
+                else:
+                    print(
+                        f"[layer {layer_position}/{len(layers)}] done: "
+                        f"layer={layer_idx}, base_vectors=0, "
+                        f"elapsed={time.perf_counter() - layer_start:.1f}s"
+                    )
                 progress.update()
             except Exception as exc:
                 print(f"Error analyzing layer {layer_idx}: {exc}")
@@ -287,8 +305,15 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
         hook: SimpleHook = runtime["hook"]
 
         structured_data: List[Dict[str, Any]] = []
+        total_batches = max(1, (len(lines) + self.batch_size - 1) // self.batch_size)
+        log_interval = max(1, total_batches // 10)
 
-        for start in range(0, len(lines), self.batch_size):
+        for batch_idx, start in enumerate(range(0, len(lines), self.batch_size), start=1):
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % log_interval == 0:
+                print(
+                    f"  layer {layer_idx}: batch {batch_idx}/{total_batches} "
+                    f"(examples {start + 1}-{min(start + self.batch_size, len(lines))}/{len(lines)})"
+                )
             batch_lines = lines[start : start + self.batch_size]
             enc = self.tokenizer(
                 batch_lines,

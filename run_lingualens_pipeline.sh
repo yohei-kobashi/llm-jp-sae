@@ -231,6 +231,7 @@ python intervener_lingualens.py \
   --crosslayer-json "$CROSSLAYER_JSON" \
   --output-dir "$INTERVENTION_DIR" \
   --selection-mode per-layer \
+  --resume \
   --prompt-file "$TEST_TXT" \
   --k "$K" \
   --normalization "$NORMALIZATION" \

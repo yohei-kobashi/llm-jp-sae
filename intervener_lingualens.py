@@ -11,9 +11,10 @@ import argparse
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from LinguaLens.lingualens.utils import (
     ProgressLogger,
@@ -32,6 +33,9 @@ class Intervener:
     util.TransformerWithSae (ported from OpenSAE style logic).
     """
 
+    _shared_transformers: Dict[Tuple[str, str, str], PreTrainedModel] = {}
+    _shared_tokenizers: Dict[str, Any] = {}
+
     def __init__(
         self,
         model_path: str,
@@ -49,7 +53,7 @@ class Intervener:
         self.k = int(k)
         self.normalization = normalization
         self.torch_dtype = torch_dtype
-        self.tokenizer = setup_tokenizer(model_path)
+        self.tokenizer = self._get_or_load_tokenizer(model_path)
 
         self.model: Optional[TransformerWithSae] = None
         self._intervention_config = InterventionConfig(
@@ -59,6 +63,52 @@ class Intervener:
         )
 
         self._load_models()
+
+    @classmethod
+    def _get_or_load_tokenizer(cls, model_path: str):
+        if model_path not in cls._shared_tokenizers:
+            cls._shared_tokenizers[model_path] = setup_tokenizer(model_path)
+        return cls._shared_tokenizers[model_path]
+
+    @classmethod
+    def _get_transformer_cache_key(
+        cls,
+        model_path: str,
+        device: str,
+        torch_dtype: Optional[torch.dtype],
+    ) -> Tuple[str, str, str]:
+        dtype_name = str(torch_dtype) if torch_dtype is not None else "none"
+        return (model_path, device, dtype_name)
+
+    @classmethod
+    def _get_or_load_shared_transformer(
+        cls,
+        model_path: str,
+        device: str,
+        torch_dtype: Optional[torch.dtype],
+    ) -> PreTrainedModel:
+        cache_key = cls._get_transformer_cache_key(model_path, device, torch_dtype)
+        if cache_key in cls._shared_transformers:
+            return cls._shared_transformers[cache_key]
+
+        print(f"Loading transformer model from {model_path}")
+        try:
+            transformer = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+            )
+        except Exception:
+            transformer = AutoModelForCausalLM.from_pretrained(model_path)
+
+        transformer = transformer.to(device)
+        if torch_dtype is not None:
+            try:
+                transformer = transformer.to(dtype=torch_dtype)
+            except Exception:
+                pass
+        transformer.eval()
+        cls._shared_transformers[cache_key] = transformer
+        return transformer
 
     @staticmethod
     def _infer_layer_idx(sae_path: str) -> int:
@@ -76,10 +126,14 @@ class Intervener:
             raise FileNotFoundError(f"SAE checkpoint not found: {self.sae_path}")
 
         print(f"Loading SAE from {self.sae_path}")
-        print(f"Loading transformer model from {self.model_path}")
+        shared_transformer = self._get_or_load_shared_transformer(
+            self.model_path,
+            self.device,
+            self.torch_dtype,
+        )
 
         self.model = TransformerWithSae(
-            transformer=self.model_path,
+            transformer=shared_transformer,
             sae=self.sae_path,
             device=self.device,
             intervention_config=self._intervention_config,
@@ -87,12 +141,6 @@ class Intervener:
             normalization=self.normalization,
             k=self.k,
         )
-
-        if self.torch_dtype is not None:
-            try:
-                self.model.transformer.to(dtype=self.torch_dtype)
-            except Exception:
-                pass
 
         self.model.transformer.eval()
         print("Models loaded successfully!")
@@ -159,24 +207,27 @@ class Intervener:
             len(input_prompts) * num_generations * 3,
             "Running intervention experiment",
         )
-        for prompt_idx, prompt in enumerate(input_prompts, start=1):
-            prompt_result = {
-                "prompt_index": prompt_idx,
-                "input_prompt": prompt,
-                "conditions": {"ablation": [], "enhancement": [], "control": []},
-            }
+        encoded_prompts = [
+            self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            for prompt in input_prompts
+        ]
 
-            with open(output_path, "a", encoding="utf-8") as out_file:
-                out_file.write(f"=== Prompt {prompt_idx} ===\n")
-                out_file.write(prompt + "\n\n")
+        with open(output_path, "a", encoding="utf-8") as out_file:
+            for prompt_idx, (prompt, inputs) in enumerate(
+                zip(input_prompts, encoded_prompts), start=1
+            ):
+                prompt_result = {
+                    "prompt_index": prompt_idx,
+                    "input_prompt": prompt,
+                    "conditions": {"ablation": [], "enhancement": [], "control": []},
+                }
+                prompt_lines = [f"=== Prompt {prompt_idx} ===\n", prompt + "\n\n"]
 
-            for generation in range(1, num_generations + 1):
-                print(f"Starting prompt {prompt_idx}, generation {generation}...")
-                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-
-                with open(output_path, "a", encoding="utf-8") as out_file:
-                    out_file.write(f"--- Prompt {prompt_idx} / Generation {generation} ---\n")
-
+                for generation in range(1, num_generations + 1):
+                    print(f"Starting prompt {prompt_idx}, generation {generation}...")
+                    prompt_lines.append(
+                        f"--- Prompt {prompt_idx} / Generation {generation} ---\n"
+                    )
                     ablation_config = InterventionConfig(
                         intervention=True,
                         intervention_mode="set",
@@ -188,8 +239,8 @@ class Intervener:
                     ablation_output = self._generate_with_intervention(
                         inputs, max_new_tokens, temperature
                     )
-                    out_file.write("[Ablation (set value=0)]:\n")
-                    out_file.write(ablation_output + "\n\n")
+                    prompt_lines.append("[Ablation (set value=0)]:\n")
+                    prompt_lines.append(ablation_output + "\n\n")
                     progress.update()
 
                     enhancement_config = InterventionConfig(
@@ -203,8 +254,8 @@ class Intervener:
                     enhancement_output = self._generate_with_intervention(
                         inputs, max_new_tokens, temperature
                     )
-                    out_file.write("[Enhancement (set value=10)]:\n")
-                    out_file.write(enhancement_output + "\n\n")
+                    prompt_lines.append("[Enhancement (set value=10)]:\n")
+                    prompt_lines.append(enhancement_output + "\n\n")
                     progress.update()
 
                     control_config = InterventionConfig(
@@ -218,19 +269,21 @@ class Intervener:
                     control_output = self._generate_with_intervention(
                         inputs, max_new_tokens, temperature
                     )
-                    out_file.write("[Control (multiply value=1)]:\n")
-                    out_file.write(control_output + "\n\n")
+                    prompt_lines.append("[Control (multiply value=1)]:\n")
+                    prompt_lines.append(control_output + "\n\n")
                     progress.update()
 
-                prompt_result["conditions"]["ablation"].append(ablation_output)
-                prompt_result["conditions"]["enhancement"].append(enhancement_output)
-                prompt_result["conditions"]["control"].append(control_output)
-                print(
-                    f"Prompt {prompt_idx}, generation {generation} completed and written "
-                    f"to {output_path}."
-                )
+                    prompt_result["conditions"]["ablation"].append(ablation_output)
+                    prompt_result["conditions"]["enhancement"].append(enhancement_output)
+                    prompt_result["conditions"]["control"].append(control_output)
+                    print(
+                        f"Prompt {prompt_idx}, generation {generation} completed and buffered "
+                        f"for {output_path}."
+                    )
 
-            experiment_results["prompt_results"].append(prompt_result)
+                out_file.write("".join(prompt_lines))
+                out_file.flush()
+                experiment_results["prompt_results"].append(prompt_result)
 
         if len(experiment_results["prompt_results"]) == 1:
             experiment_results["conditions"] = experiment_results["prompt_results"][0][
@@ -453,6 +506,27 @@ def _save_selection_metadata(
     return selection_path
 
 
+def _get_result_paths(output_path: str) -> Dict[str, str]:
+    return {
+        "output_path": output_path,
+        "results_json": output_path.replace(".txt", "_results.json"),
+        "selection_json": output_path.replace(".txt", "_selection.json"),
+    }
+
+
+def _is_completed_run(output_path: str) -> bool:
+    paths = _get_result_paths(output_path)
+    return all(os.path.exists(path) for path in paths.values())
+
+
+def _load_existing_selection(output_path: str) -> Optional[Dict[str, Any]]:
+    selection_path = _get_result_paths(output_path)["selection_json"]
+    if not os.path.exists(selection_path):
+        return None
+    with open(selection_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _run_single_candidate(
     args: argparse.Namespace,
     candidate: Dict[str, Any],
@@ -460,6 +534,29 @@ def _run_single_candidate(
     output_path: str,
     experiment_name: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if args.resume and _is_completed_run(output_path):
+        print(f"Skipping completed run: {output_path}")
+        existing = _load_existing_selection(output_path)
+        if existing is not None:
+            existing["resume_status"] = "skipped_completed"
+            return existing
+        return {
+            "cross_json": args.crosslayer_json,
+            "selected_layer_idx": candidate["layer_idx"],
+            "selected_base_vector": candidate["base_vector"],
+            "selected_frc": candidate["frc"],
+            "sae_path": args.sae_path_template.format(candidate["layer_idx"]),
+            "resume_status": "skipped_completed",
+        }
+
+    if args.resume:
+        paths = _get_result_paths(output_path)
+        existing_paths = [path for path in paths.values() if os.path.exists(path)]
+        if existing_paths:
+            print(
+                f"Resuming incomplete run by overwriting partial outputs: {output_path}"
+            )
+
     sae_path = args.sae_path_template.format(candidate["layer_idx"])
     input_prompts = _split_prompts(prompt_text)
 
@@ -470,6 +567,7 @@ def _run_single_candidate(
         "selected_frc": candidate["frc"],
         "sae_path": sae_path,
         "input_prompts": input_prompts,
+        "resume_status": "executed",
     }
     selection_path = _save_selection_metadata(output_path, selection_meta)
 
@@ -589,6 +687,11 @@ def main() -> int:
         choices=["best", "per-layer"],
         default="best",
         help="How to select intervention targets from crosslayer_json.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip runs whose output txt/results/selection files already exist.",
     )
 
     args = parser.parse_args()

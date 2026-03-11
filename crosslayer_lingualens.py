@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -59,11 +60,28 @@ class TrainSaeCrossLayerAnalyzer:
         layers: List[int],
         top_k: int = 10,
     ) -> Dict[str, Any]:
-        print(f"Analyzing feature evolution across {len(layers)} layers...")
+        start_time = time.perf_counter()
+        print(f"[crosslayer] feature file: {feature_file}")
+        print(f"[crosslayer] analyzing {len(layers)} layers: {','.join(map(str, layers))}")
+        print("[crosslayer] phase 1/3: per-layer analysis")
 
         base_results = self.analyzer.analyze_feature(feature_file, layers, top_k)
+        print("[crosslayer] phase 2/3: extracting cross-layer evolution")
         evolution_data = self._extract_evolution_data(base_results, layers)
+        print("[crosslayer] phase 3/3: computing cross-layer statistics")
         cross_layer_stats = self._compute_cross_layer_stats(evolution_data)
+
+        completed_layers = len(
+            [
+                layer
+                for layer, result in base_results.get("layer_results", {}).items()
+                if "top_features" in result
+            ]
+        )
+        print(
+            f"[crosslayer] done: completed_layers={completed_layers}/{len(layers)}, "
+            f"elapsed={time.perf_counter() - start_time:.1f}s"
+        )
 
         return {
             "feature_file": feature_file,
@@ -404,7 +422,14 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
     layers = _parse_layers(args.layers)
+    total_start = time.perf_counter()
 
+    print("[1/4] Preparing cross-layer analysis")
+    print(f"      model: {args.model_path}")
+    print(f"      layers: {','.join(map(str, layers))}")
+    print(f"      output_dir: {args.output_dir}")
+
+    print("[2/4] Initializing analyzer")
     analyzer = TrainSaeCrossLayerAnalyzer(
         model_path=args.model_path,
         sae_path_template=args.sae_path_template,
@@ -417,6 +442,7 @@ def main() -> None:
 
     try:
         if args.feature_file:
+            print(f"[3/4] Running single-feature analysis: {args.feature_file}")
             results = analyzer.analyze_feature_evolution(
                 feature_file=args.feature_file,
                 layers=layers,
@@ -424,6 +450,7 @@ def main() -> None:
             )
             feature_name = os.path.splitext(os.path.basename(args.feature_file))[0]
             output_json = os.path.join(args.output_dir, f"{feature_name}_evolution.json")
+            print("[4/4] Saving outputs")
             save_json_results(results, output_json)
             print(f"Saved evolution result: {output_json}")
 
@@ -442,12 +469,16 @@ def main() -> None:
                 )
 
         if args.feature_files:
+            print(
+                f"[3/4] Running multi-feature analysis: {len(args.feature_files)} files"
+            )
             compare_results = analyzer.compare_features_across_layers(
                 feature_files=args.feature_files,
                 layers=layers,
                 output_dir=args.output_dir,
                 top_k=args.top_k,
             )
+            print("[4/4] Saving outputs")
             print(
                 "Feature comparison complete. "
                 f"Analyzed: {len(compare_results.get('feature_results', {}))}"
@@ -466,6 +497,7 @@ def main() -> None:
                         )
                     except Exception as exc:
                         print(f"Failed to plot {feature_name}: {exc}")
+        print(f"Total elapsed: {time.perf_counter() - total_start:.1f}s")
     finally:
         analyzer.clear_cache()
 

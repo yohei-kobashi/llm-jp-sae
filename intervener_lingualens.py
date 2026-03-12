@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+from glob import glob
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -421,7 +422,46 @@ def _split_prompts(prompt_text: str) -> List[str]:
     return prompts
 
 
+def _collect_crosslayer_json_paths(crosslayer_path: str) -> List[str]:
+    if os.path.isdir(crosslayer_path):
+        paths = sorted(glob(os.path.join(crosslayer_path, "*_layer*_evolution.json")))
+        if not paths:
+            raise FileNotFoundError(
+                f"No per-layer crosslayer JSON files found in directory: {crosslayer_path}"
+            )
+        return paths
+
+    if not os.path.exists(crosslayer_path):
+        raise FileNotFoundError(f"Crosslayer input not found: {crosslayer_path}")
+    return [crosslayer_path]
+
+
+def _load_crosslayer_jsons(crosslayer_path: str) -> List[Tuple[str, Dict[str, Any]]]:
+    loaded = []
+    for path in _collect_crosslayer_json_paths(crosslayer_path):
+        with open(path, "r", encoding="utf-8") as f:
+            loaded.append((path, json.load(f)))
+    return loaded
+
+
 def _select_best_intervention_candidate(crosslayer_results: Dict[str, Any]) -> Dict[str, Any]:
+    if "layer_candidates" in crosslayer_results:
+        best = None
+        for layer_str, info in crosslayer_results.get("layer_candidates", {}).items():
+            if info.get("status") != "ready":
+                continue
+            candidate = {
+                "base_vectors": [
+                    int(base_vec) for base_vec in info.get("base_vectors", [info["base_vector"]])
+                ],
+                "layer_idx": int(info.get("layer_idx", layer_str)),
+                "frc": float(info["frc"]),
+            }
+            if best is None or candidate["frc"] > best["frc"]:
+                best = candidate
+        if best is not None:
+            return best
+
     best = None
     base_vector_evolution = (
         crosslayer_results.get("evolution_data", {}).get("base_vector_evolution", {})
@@ -466,9 +506,45 @@ def _select_best_intervention_candidate(crosslayer_results: Dict[str, Any]) -> D
     raise RuntimeError("No intervention candidate found in crosslayer results.")
 
 
+def _select_best_intervention_candidate_from_many(
+    crosslayer_entries: List[Tuple[str, Dict[str, Any]]]
+) -> Dict[str, Any]:
+    best = None
+    for path, crosslayer_results in crosslayer_entries:
+        candidate = _select_best_intervention_candidate(crosslayer_results)
+        candidate["cross_json"] = path
+        if best is None or candidate["frc"] > best["frc"]:
+            best = candidate
+    if best is None:
+        raise RuntimeError("No intervention candidate found in crosslayer inputs.")
+    return best
+
+
 def _select_per_layer_intervention_candidates(
     crosslayer_results: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
+    if "layer_candidates" in crosslayer_results:
+        candidates = []
+        for layer_str, info in sorted(
+            crosslayer_results.get("layer_candidates", {}).items(),
+            key=lambda item: int(item[0]),
+        ):
+            if info.get("status") != "ready":
+                continue
+            candidates.append(
+                {
+                    "base_vectors": [
+                        int(base_vec)
+                        for base_vec in info.get("base_vectors", [info["base_vector"]])
+                    ],
+                    "layer_idx": int(info.get("layer_idx", layer_str)),
+                    "frc": float(info["frc"]),
+                }
+            )
+        if not candidates:
+            raise RuntimeError("No per-layer intervention candidates found in layer-candidate summary.")
+        return candidates
+
     layer_results = crosslayer_results.get("base_results", {}).get("layer_results", {})
     candidates: List[Dict[str, Any]] = []
 
@@ -496,6 +572,28 @@ def _select_per_layer_intervention_candidates(
     if not candidates:
         raise RuntimeError("No per-layer intervention candidates found in crosslayer results.")
 
+    return candidates
+
+
+def _select_per_layer_intervention_candidates_from_many(
+    crosslayer_entries: List[Tuple[str, Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    candidates = []
+    for path, crosslayer_results in crosslayer_entries:
+        per_file_candidates = _select_per_layer_intervention_candidates(crosslayer_results)
+        if len(per_file_candidates) != 1:
+            raise RuntimeError(
+                "Per-layer crosslayer file should contain exactly one layer result: "
+                f"{path}"
+            )
+        candidate = per_file_candidates[0]
+        candidate["cross_json"] = path
+        candidates.append(candidate)
+
+    if not candidates:
+        raise RuntimeError("No per-layer intervention candidates found in crosslayer inputs.")
+
+    candidates.sort(key=lambda item: int(item["layer_idx"]))
     return candidates
 
 
@@ -546,7 +644,7 @@ def _run_single_candidate(
             existing["resume_status"] = "skipped_completed"
             return existing
         return {
-            "cross_json": args.crosslayer_json,
+            "cross_json": candidate.get("cross_json", args.crosslayer_json),
             "selected_layer_idx": candidate["layer_idx"],
             "selected_base_vectors": candidate["base_vectors"],
             "selected_frc": candidate["frc"],
@@ -566,7 +664,7 @@ def _run_single_candidate(
     input_prompts = _split_prompts(prompt_text)
 
     selection_meta = {
-        "cross_json": args.crosslayer_json,
+        "cross_json": candidate.get("cross_json", args.crosslayer_json),
         "selected_layer_idx": candidate["layer_idx"],
         "selected_base_vectors": candidate["base_vectors"],
         "selected_frc": candidate["frc"],
@@ -630,7 +728,7 @@ def main() -> int:
     parser.add_argument(
         "--crosslayer-json",
         required=True,
-        help="Path to *_evolution.json generated by crosslayer_lingualens.py.",
+        help="Path to a per-layer crosslayer JSON file or a directory containing *_layer*_evolution.json files.",
     )
     parser.add_argument(
         "--output-path",
@@ -705,8 +803,7 @@ def main() -> int:
     if args.selection_mode == "per-layer" and not args.output_dir:
         raise ValueError("--output-dir is required when --selection-mode=per-layer.")
 
-    with open(args.crosslayer_json, "r", encoding="utf-8") as f:
-        crosslayer_results = json.load(f)
+    crosslayer_entries = _load_crosslayer_jsons(args.crosslayer_json)
 
     prompt_text = args.prompt
     if args.prompt_file:
@@ -714,7 +811,7 @@ def main() -> int:
             prompt_text = f.read()
 
     if args.selection_mode == "best":
-        best = _select_best_intervention_candidate(crosslayer_results)
+        best = _select_best_intervention_candidate_from_many(crosslayer_entries)
         _run_single_candidate(
             args=args,
             candidate=best,
@@ -725,13 +822,7 @@ def main() -> int:
         return 0
 
     os.makedirs(args.output_dir, exist_ok=True)
-    candidates = _select_per_layer_intervention_candidates(crosslayer_results)
-    summary = {
-        "cross_json": args.crosslayer_json,
-        "selection_mode": args.selection_mode,
-        "output_dir": args.output_dir,
-        "runs": [],
-    }
+    candidates = _select_per_layer_intervention_candidates_from_many(crosslayer_entries)
 
     for candidate in candidates:
         output_path = os.path.join(
@@ -740,19 +831,13 @@ def main() -> int:
         experiment_name = args.experiment_name or (
             f"intervention_layer{candidate['layer_idx']}_bv{'-'.join(map(str, candidate['base_vectors']))}"
         )
-        selection_meta = _run_single_candidate(
+        _run_single_candidate(
             args=args,
             candidate=candidate,
             prompt_text=prompt_text,
             output_path=output_path,
             experiment_name=experiment_name,
         )
-        summary["runs"].append(selection_meta)
-
-    summary_path = os.path.join(args.output_dir, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f"Per-layer intervention summary saved to {summary_path}")
     return 0
 
 

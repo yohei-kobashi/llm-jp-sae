@@ -166,9 +166,6 @@ mkdir -p "$DATA_DIR" "$CROSSLAYER_DIR" "$INTERVENTION_DIR"
 TRAIN_TXT="$DATA_DIR/${TARGET_SLUG}_train.txt"
 TEST_TXT="$DATA_DIR/${TARGET_SLUG}_test.txt"
 TEST_JSONL="$DATA_DIR/${TARGET_SLUG}_test.jsonl"
-CROSSLAYER_JSON="$CROSSLAYER_DIR/$(basename "${TRAIN_TXT%.txt}")_evolution.json"
-LAYER_CANDIDATES_JSON="$CROSSLAYER_DIR/$(basename "${TRAIN_TXT%.txt}")_layer_candidates.json"
-SUMMARY_JSON="$INTERVENTION_DIR/summary.json"
 
 DEVICE_ARGS=()
 if [[ -n "$DEVICE" ]]; then
@@ -256,16 +253,50 @@ elif (( START_STEP > 2 )) && [[ -z "$LAYERS" ]]; then
   LAYERS="$(IFS=,; echo "${SORTED_LAYERS[*]}")"
 fi
 
+ALL_LAYERS="$LAYERS"
+LAYERS_FOR_CROSSLAYER="$LAYERS"
+
+if (( START_STEP <= 3 )); then
+  FEATURE_NAME="$(basename "${TRAIN_TXT%.txt}")"
+  IFS=',' read -r -a ALL_LAYER_ARRAY <<< "$ALL_LAYERS"
+  EXISTING_CROSSLAYER_LAYERS=()
+  for layer in "${ALL_LAYER_ARRAY[@]}"; do
+    LAYER_JSON="$CROSSLAYER_DIR/${FEATURE_NAME}_layer${layer}_evolution.json"
+    if [[ -f "$LAYER_JSON" ]]; then
+      EXISTING_CROSSLAYER_LAYERS+=("$layer")
+    fi
+  done
+
+  if [[ ${#EXISTING_CROSSLAYER_LAYERS[@]} -gt 0 ]]; then
+    IFS=$'\n' read -r -d '' -a SORTED_EXISTING_LAYERS < <(
+      printf '%s\n' "${EXISTING_CROSSLAYER_LAYERS[@]}" | sort -n && printf '\0'
+    )
+    RESUME_FROM_LAYER="${SORTED_EXISTING_LAYERS[-1]}"
+    RESUME_LAYER_ARRAY=()
+    for layer in "${ALL_LAYER_ARRAY[@]}"; do
+      if (( layer >= RESUME_FROM_LAYER )); then
+        RESUME_LAYER_ARRAY+=("$layer")
+      fi
+    done
+
+    if [[ ${#RESUME_LAYER_ARRAY[@]} -gt 0 ]]; then
+      LAYERS_FOR_CROSSLAYER="$(IFS=,; echo "${RESUME_LAYER_ARRAY[*]}")"
+      echo "[3/4] Detected existing crosslayer outputs through layer ${RESUME_FROM_LAYER}"
+      echo "      resuming with layers: $LAYERS_FOR_CROSSLAYER"
+    fi
+  fi
+fi
+
 if (( START_STEP <= 3 )); then
   if [[ ! -f "$TRAIN_TXT" ]]; then
     echo "Missing train data required for step 3: $TRAIN_TXT" >&2
     exit 1
   fi
-  echo "[3/4] Running cross-layer analysis on layers: $LAYERS"
+  echo "[3/4] Running cross-layer analysis on layers: $LAYERS_FOR_CROSSLAYER"
   python crosslayer_lingualens.py \
     --model-path "$MODEL_PATH" \
     --sae-path-template "$SAE_PATH_TEMPLATE" \
-    --layers "$LAYERS" \
+    --layers "$LAYERS_FOR_CROSSLAYER" \
     --feature-file "$TRAIN_TXT" \
     --output-dir "$CROSSLAYER_DIR" \
     --top-k "$TOP_K" \
@@ -273,15 +304,26 @@ if (( START_STEP <= 3 )); then
     --normalization "$NORMALIZATION" \
     --batch-size "$BATCH_SIZE" \
     --torch-dtype "$TORCH_DTYPE" \
-    --export-layer-candidates \
-    --layer-candidates-output "$LAYER_CANDIDATES_JSON" \
     "${DEVICE_ARGS[@]}"
 else
   echo "[3/4] Skipped cross-layer analysis (--start-step=$START_STEP)"
 fi
 
-if [[ ! -f "$CROSSLAYER_JSON" ]]; then
-  echo "Cross-layer output not found: $CROSSLAYER_JSON" >&2
+FEATURE_NAME="$(basename "${TRAIN_TXT%.txt}")"
+IFS=',' read -r -a LAYER_ARRAY <<< "$ALL_LAYERS"
+MISSING_LAYER_JSONS=()
+for layer in "${LAYER_ARRAY[@]}"; do
+  LAYER_JSON="$CROSSLAYER_DIR/${FEATURE_NAME}_layer${layer}_evolution.json"
+  if [[ ! -f "$LAYER_JSON" ]]; then
+    MISSING_LAYER_JSONS+=("$LAYER_JSON")
+  fi
+done
+
+if [[ ${#MISSING_LAYER_JSONS[@]} -gt 0 ]]; then
+  echo "Missing per-layer crosslayer outputs required for step 4:" >&2
+  for path in "${MISSING_LAYER_JSONS[@]}"; do
+    echo "  $path" >&2
+  done
   exit 1
 fi
 
@@ -291,25 +333,33 @@ if [[ ! -f "$TEST_TXT" ]]; then
 fi
 
 echo "[4/4] Running layer-wise interventions with test prompts"
-python intervener_lingualens.py \
-  --model-path "$MODEL_PATH" \
-  --sae-path-template "$SAE_PATH_TEMPLATE" \
-  --crosslayer-json "$CROSSLAYER_JSON" \
-  --output-dir "$INTERVENTION_DIR" \
-  --selection-mode per-layer \
-  --resume \
-  --prompt-file "$TEST_TXT" \
-  --k "$K" \
-  --normalization "$NORMALIZATION" \
-  --torch-dtype "$TORCH_DTYPE" \
-  --num-generations "$NUM_GENERATIONS" \
-  --max-new-tokens "$MAX_NEW_TOKENS" \
-  --temperature "$TEMPERATURE" \
-  "${DEVICE_ARGS[@]}"
+for layer in "${LAYER_ARRAY[@]}"; do
+  LAYER_JSON="$CROSSLAYER_DIR/${FEATURE_NAME}_layer${layer}_evolution.json"
+  if [[ ! -f "$LAYER_JSON" ]]; then
+    echo "Missing crosslayer JSON for intervention: $LAYER_JSON" >&2
+    exit 1
+  fi
+
+  echo "      layer ${layer}"
+  python intervener_lingualens.py \
+    --model-path "$MODEL_PATH" \
+    --sae-path-template "$SAE_PATH_TEMPLATE" \
+    --crosslayer-json "$LAYER_JSON" \
+    --output-dir "$INTERVENTION_DIR" \
+    --selection-mode per-layer \
+    --resume \
+    --prompt-file "$TEST_TXT" \
+    --k "$K" \
+    --normalization "$NORMALIZATION" \
+    --torch-dtype "$TORCH_DTYPE" \
+    --num-generations "$NUM_GENERATIONS" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    --temperature "$TEMPERATURE" \
+    "${DEVICE_ARGS[@]}"
+done
 
 echo "Finished."
 echo "Train data: $TRAIN_TXT"
 echo "Test data: $TEST_TXT"
-echo "Cross-layer result: $CROSSLAYER_JSON"
-echo "Layer candidates: $LAYER_CANDIDATES_JSON"
-echo "Intervention summary: $SUMMARY_JSON"
+echo "Cross-layer directory: $CROSSLAYER_DIR"
+echo "Intervention directory: $INTERVENTION_DIR"

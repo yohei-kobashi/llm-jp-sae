@@ -305,42 +305,45 @@ def _parse_torch_dtype(dtype_name: str) -> torch.dtype:
     return mapping[dtype_name]
 
 
-def _extract_layer_candidates(results: Dict[str, Any], layers: List[int]) -> Dict[str, Any]:
-    layer_results = results.get("base_results", {}).get("layer_results", {})
-    candidates: Dict[str, Any] = {
-        "feature_file": results.get("feature_file"),
-        "layers": layers,
-        "layer_candidates": {},
+def _build_single_layer_result(
+    base_results: Dict[str, Any],
+    layer: int,
+) -> Dict[str, Any]:
+    layer_results = base_results.get("layer_results", {})
+    layer_result = layer_results.get(layer, layer_results.get(str(layer), {}))
+
+    return {
+        "feature_file": base_results.get("feature_file"),
+        "layer_idx": layer,
+        "base_results": {
+            "feature_file": base_results.get("feature_file"),
+            "total_examples": base_results.get("total_examples"),
+            "layers_analyzed": [layer],
+            "top_k": base_results.get("top_k"),
+            "layer_results": {layer: layer_result} if layer_result else {},
+            "unified_results": [
+                item
+                for item in base_results.get("unified_results", [])
+                if int(item.get("layer", -1)) == int(layer)
+            ],
+        },
     }
 
-    for layer in layers:
-        result = layer_results.get(layer, layer_results.get(str(layer), {}))
-        top_features = result.get("top_features", [])
-        if not top_features:
-            candidates["layer_candidates"][str(layer)] = {
-                "status": "missing_top_features",
-            }
-            continue
 
-        base_vector, frc = top_features[0]
-        candidates["layer_candidates"][str(layer)] = {
-            "status": "ready",
-            "layer_idx": int(layer),
-            "base_vector": int(base_vector),
-            "frc": float(frc),
-        }
-
-    return candidates
-
-
-def _save_layer_candidates(
-    results: Dict[str, Any],
+def _save_split_layer_results(
+    base_results: Dict[str, Any],
     layers: List[int],
-    output_path: str,
-) -> None:
-    candidates = _extract_layer_candidates(results, layers)
-    save_json_results(candidates, output_path)
-    print(f"Saved layer candidates: {output_path}")
+    output_dir: str,
+    feature_name: str,
+) -> List[str]:
+    output_paths = []
+    for layer in layers:
+        single_layer_result = _build_single_layer_result(base_results, layer)
+        output_path = os.path.join(output_dir, f"{feature_name}_layer{layer}_evolution.json")
+        save_json_results(single_layer_result, output_path)
+        output_paths.append(output_path)
+        print(f"Saved layer result: {output_path}")
+    return output_paths
 
 
 def main() -> None:
@@ -405,17 +408,6 @@ def main() -> None:
         action="store_true",
         help="If set, save an evolution plot for single feature mode.",
     )
-    parser.add_argument(
-        "--export-layer-candidates",
-        action="store_true",
-        help="If set in single feature mode, save each layer's top base vector as JSON.",
-    )
-    parser.add_argument(
-        "--layer-candidates-output",
-        default=None,
-        help="Optional path for layer-candidate JSON. Default: <output-dir>/<feature>_layer_candidates.json",
-    )
-
     args = parser.parse_args()
     if not args.feature_file and not args.feature_files:
         raise ValueError("Specify --feature-file or --feature-files.")
@@ -443,29 +435,19 @@ def main() -> None:
     try:
         if args.feature_file:
             print(f"[3/4] Running single-feature analysis: {args.feature_file}")
-            results = analyzer.analyze_feature_evolution(
+            base_results = analyzer.analyzer.analyze_feature(
                 feature_file=args.feature_file,
                 layers=layers,
                 top_k=args.top_k,
             )
             feature_name = os.path.splitext(os.path.basename(args.feature_file))[0]
-            output_json = os.path.join(args.output_dir, f"{feature_name}_evolution.json")
             print("[4/4] Saving outputs")
-            save_json_results(results, output_json)
-            print(f"Saved evolution result: {output_json}")
-
-            if args.export_layer_candidates:
-                candidates_output = args.layer_candidates_output or os.path.join(
-                    args.output_dir, f"{feature_name}_layer_candidates.json"
-                )
-                _save_layer_candidates(results, layers, candidates_output)
+            _save_split_layer_results(base_results, layers, args.output_dir, feature_name)
 
             if args.plot:
-                plot_path = os.path.join(
-                    args.output_dir, f"{feature_name}_{args.plot_metric}.png"
-                )
-                analyzer.generate_evolution_plot(
-                    results, plot_path, metric=args.plot_metric
+                print(
+                    "Skipping plot generation in single-feature mode. "
+                    "Use postprocess_crosslayer_lingualens.py on the per-layer outputs."
                 )
 
         if args.feature_files:

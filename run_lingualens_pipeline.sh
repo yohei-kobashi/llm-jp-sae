@@ -12,6 +12,7 @@ Usage:
     [--layers 0,1,2] \
     [--input-jsonl data/minimal_pairs_acceptability.jsonl] \
     [--output-root outputs/lingualens] \
+    [--start-step 1] \
     [--test-ratio 0.1] \
     [--seed 42] \
     [--top-k 10] \
@@ -32,6 +33,7 @@ Required arguments:
 Optional arguments:
   --layers               Comma-separated layer indices. If omitted, auto-detected
                          from files matching SAE_PATH_TEMPLATE.
+  --start-step           Step number to start from (1-4).
 EOF
 }
 
@@ -44,12 +46,13 @@ SAE_PATH_TEMPLATE="sae/n_d_16/k_32/nl_Scalar/ckpt_0988240/lr_0.001/sae_layer{}.p
 LAYERS=""
 INPUT_JSONL="data/minimal_pairs_acceptability.jsonl"
 OUTPUT_ROOT="outputs/lingualens"
+START_STEP="1"
 TEST_RATIO="0.1"
 SEED="42"
 TOP_K="10"
 K="32"
 NORMALIZATION="Scalar"
-BATCH_SIZE="16"
+BATCH_SIZE="32"
 TORCH_DTYPE="bfloat16"
 DEVICE=""
 NUM_GENERATIONS="5"
@@ -80,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --output-root)
       OUTPUT_ROOT="$2"
+      shift 2
+      ;;
+    --start-step)
+      START_STEP="$2"
       shift 2
       ;;
     --test-ratio)
@@ -144,6 +151,11 @@ if [[ -z "$TARGET" || -z "$MODEL_PATH" || -z "$SAE_PATH_TEMPLATE" ]]; then
   exit 1
 fi
 
+if [[ ! "$START_STEP" =~ ^[1-4]$ ]]; then
+  echo "--start-step must be one of: 1, 2, 3, 4" >&2
+  exit 1
+fi
+
 TARGET_SLUG="${TARGET// /_}"
 TARGET_DIR="${OUTPUT_ROOT%/}/${TARGET_SLUG}"
 DATA_DIR="$TARGET_DIR/data"
@@ -163,18 +175,59 @@ if [[ -n "$DEVICE" ]]; then
   DEVICE_ARGS+=(--device "$DEVICE")
 fi
 
-echo "[1/4] Generating train/test data for target: $TARGET"
-python convert_jsonl_to_lingualens_text.py \
-  --input "$INPUT_JSONL" \
-  --output "$TRAIN_TXT" \
-  --test-output "$TEST_TXT" \
-  --test-output-jsonl "$TEST_JSONL" \
-  --test-ratio "$TEST_RATIO" \
-  --seed "$SEED" \
-  --target "$TARGET"
+if (( START_STEP <= 1 )); then
+  echo "[1/4] Generating train/test data for target: $TARGET"
+  python convert_jsonl_to_lingualens_text.py \
+    --input "$INPUT_JSONL" \
+    --output "$TRAIN_TXT" \
+    --test-output "$TEST_TXT" \
+    --test-output-jsonl "$TEST_JSONL" \
+    --test-ratio "$TEST_RATIO" \
+    --seed "$SEED" \
+    --target "$TARGET"
+else
+  echo "[1/4] Skipped data generation (--start-step=$START_STEP)"
+  if [[ ! -f "$TRAIN_TXT" || ! -f "$TEST_TXT" || ! -f "$TEST_JSONL" ]]; then
+    echo "Missing generated data required to skip step 1." >&2
+    echo "Expected files:" >&2
+    echo "  $TRAIN_TXT" >&2
+    echo "  $TEST_TXT" >&2
+    echo "  $TEST_JSONL" >&2
+    exit 1
+  fi
+fi
 
-if [[ -z "$LAYERS" ]]; then
+if (( START_STEP <= 2 )) && [[ -z "$LAYERS" ]]; then
   echo "[2/4] Detecting layers from SAE template"
+  TEMPLATE_GLOB="${SAE_PATH_TEMPLATE//\{\}/*}"
+  shopt -s nullglob
+  MATCHED_PATHS=($TEMPLATE_GLOB)
+  shopt -u nullglob
+
+  if [[ ${#MATCHED_PATHS[@]} -eq 0 ]]; then
+    echo "Could not auto-detect layers from template: $SAE_PATH_TEMPLATE" >&2
+    echo "Pass --layers explicitly." >&2
+    exit 1
+  fi
+
+  DETECTED_LAYERS=()
+  for path in "${MATCHED_PATHS[@]}"; do
+    filename="$(basename "$path")"
+    if [[ "$filename" =~ layer([0-9]+) ]]; then
+      DETECTED_LAYERS+=("${BASH_REMATCH[1]}")
+    fi
+  done
+
+  if [[ ${#DETECTED_LAYERS[@]} -eq 0 ]]; then
+    echo "No layer indices found in filenames matching: $SAE_PATH_TEMPLATE" >&2
+    exit 1
+  fi
+
+  IFS=$'\n' read -r -d '' -a SORTED_LAYERS < <(printf '%s\n' "${DETECTED_LAYERS[@]}" | sort -n -u && printf '\0')
+  LAYERS="$(IFS=,; echo "${SORTED_LAYERS[*]}")"
+elif (( START_STEP > 2 )) && [[ -z "$LAYERS" ]]; then
+  echo "[2/4] Skipped layer detection (--start-step=$START_STEP)"
+  echo "LAYERS is not specified, so auto-detecting layers from SAE template for downstream steps"
   TEMPLATE_GLOB="${SAE_PATH_TEMPLATE//\{\}/*}"
   shopt -s nullglob
   MATCHED_PATHS=($TEMPLATE_GLOB)
@@ -203,24 +256,37 @@ if [[ -z "$LAYERS" ]]; then
   LAYERS="$(IFS=,; echo "${SORTED_LAYERS[*]}")"
 fi
 
-echo "[3/4] Running cross-layer analysis on layers: $LAYERS"
-python crosslayer_lingualens.py \
-  --model-path "$MODEL_PATH" \
-  --sae-path-template "$SAE_PATH_TEMPLATE" \
-  --layers "$LAYERS" \
-  --feature-file "$TRAIN_TXT" \
-  --output-dir "$CROSSLAYER_DIR" \
-  --top-k "$TOP_K" \
-  --k "$K" \
-  --normalization "$NORMALIZATION" \
-  --batch-size "$BATCH_SIZE" \
-  --torch-dtype "$TORCH_DTYPE" \
-  --export-layer-candidates \
-  --layer-candidates-output "$LAYER_CANDIDATES_JSON" \
-  "${DEVICE_ARGS[@]}"
+if (( START_STEP <= 3 )); then
+  if [[ ! -f "$TRAIN_TXT" ]]; then
+    echo "Missing train data required for step 3: $TRAIN_TXT" >&2
+    exit 1
+  fi
+  echo "[3/4] Running cross-layer analysis on layers: $LAYERS"
+  python crosslayer_lingualens.py \
+    --model-path "$MODEL_PATH" \
+    --sae-path-template "$SAE_PATH_TEMPLATE" \
+    --layers "$LAYERS" \
+    --feature-file "$TRAIN_TXT" \
+    --output-dir "$CROSSLAYER_DIR" \
+    --top-k "$TOP_K" \
+    --k "$K" \
+    --normalization "$NORMALIZATION" \
+    --batch-size "$BATCH_SIZE" \
+    --torch-dtype "$TORCH_DTYPE" \
+    --export-layer-candidates \
+    --layer-candidates-output "$LAYER_CANDIDATES_JSON" \
+    "${DEVICE_ARGS[@]}"
+else
+  echo "[3/4] Skipped cross-layer analysis (--start-step=$START_STEP)"
+fi
 
 if [[ ! -f "$CROSSLAYER_JSON" ]]; then
   echo "Cross-layer output not found: $CROSSLAYER_JSON" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TEST_TXT" ]]; then
+  echo "Missing test data required for step 4: $TEST_TXT" >&2
   exit 1
 fi
 

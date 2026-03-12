@@ -9,6 +9,7 @@ TrainSaeLinguisticAnalyzer so it works with SAEs saved as:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from collections import defaultdict
@@ -346,6 +347,28 @@ def _save_split_layer_results(
     return output_paths
 
 
+def _is_completed_layer_output(
+    output_path: str,
+    expected_layer: int,
+) -> bool:
+    if not os.path.exists(output_path):
+        return False
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    layer_idx = data.get("layer_idx")
+    if layer_idx is not None and int(layer_idx) != int(expected_layer):
+        return False
+
+    base_results = data.get("base_results", {})
+    layer_results = base_results.get("layer_results", {})
+    layer_result = layer_results.get(expected_layer, layer_results.get(str(expected_layer), {}))
+    return bool(layer_result) and "top_features" in layer_result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cross-layer analysis for train.py SAE checkpoints."
@@ -408,6 +431,11 @@ def main() -> None:
         action="store_true",
         help="If set, save an evolution plot for single feature mode.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip already-saved per-layer outputs in single-feature mode.",
+    )
     args = parser.parse_args()
     if not args.feature_file and not args.feature_files:
         raise ValueError("Specify --feature-file or --feature-files.")
@@ -435,14 +463,33 @@ def main() -> None:
     try:
         if args.feature_file:
             print(f"[3/4] Running single-feature analysis: {args.feature_file}")
-            base_results = analyzer.analyzer.analyze_feature(
-                feature_file=args.feature_file,
-                layers=layers,
-                top_k=args.top_k,
-            )
             feature_name = os.path.splitext(os.path.basename(args.feature_file))[0]
             print("[4/4] Saving outputs")
-            _save_split_layer_results(base_results, layers, args.output_dir, feature_name)
+            completed_layers = 0
+            for layer_position, layer in enumerate(layers, start=1):
+                output_path = os.path.join(
+                    args.output_dir, f"{feature_name}_layer{layer}_evolution.json"
+                )
+                if args.resume and _is_completed_layer_output(output_path, layer):
+                    print(f"[layer {layer_position}/{len(layers)}] skipping saved output: {output_path}")
+                    completed_layers += 1
+                    continue
+
+                layer_result = analyzer.analyzer.analyze_feature_layer(
+                    feature_file=args.feature_file,
+                    layer_idx=layer,
+                    top_k=args.top_k,
+                    layer_position=layer_position,
+                    total_layers=len(layers),
+                )
+                single_layer_result = _build_single_layer_result(layer_result, layer)
+                save_json_results(single_layer_result, output_path)
+                print(f"Saved layer result: {output_path}")
+                completed_layers += 1
+
+            print(
+                f"Single-feature analysis complete. Saved or reused {completed_layers}/{len(layers)} layers."
+            )
 
             if args.plot:
                 print(

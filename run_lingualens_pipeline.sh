@@ -254,49 +254,17 @@ elif (( START_STEP > 2 )) && [[ -z "$LAYERS" ]]; then
 fi
 
 ALL_LAYERS="$LAYERS"
-LAYERS_FOR_CROSSLAYER="$LAYERS"
-
-if (( START_STEP <= 3 )); then
-  FEATURE_NAME="$(basename "${TRAIN_TXT%.txt}")"
-  IFS=',' read -r -a ALL_LAYER_ARRAY <<< "$ALL_LAYERS"
-  EXISTING_CROSSLAYER_LAYERS=()
-  for layer in "${ALL_LAYER_ARRAY[@]}"; do
-    LAYER_JSON="$CROSSLAYER_DIR/${FEATURE_NAME}_layer${layer}_evolution.json"
-    if [[ -f "$LAYER_JSON" ]]; then
-      EXISTING_CROSSLAYER_LAYERS+=("$layer")
-    fi
-  done
-
-  if [[ ${#EXISTING_CROSSLAYER_LAYERS[@]} -gt 0 ]]; then
-    IFS=$'\n' read -r -d '' -a SORTED_EXISTING_LAYERS < <(
-      printf '%s\n' "${EXISTING_CROSSLAYER_LAYERS[@]}" | sort -n && printf '\0'
-    )
-    RESUME_FROM_LAYER="${SORTED_EXISTING_LAYERS[-1]}"
-    RESUME_LAYER_ARRAY=()
-    for layer in "${ALL_LAYER_ARRAY[@]}"; do
-      if (( layer >= RESUME_FROM_LAYER )); then
-        RESUME_LAYER_ARRAY+=("$layer")
-      fi
-    done
-
-    if [[ ${#RESUME_LAYER_ARRAY[@]} -gt 0 ]]; then
-      LAYERS_FOR_CROSSLAYER="$(IFS=,; echo "${RESUME_LAYER_ARRAY[*]}")"
-      echo "[3/4] Detected existing crosslayer outputs through layer ${RESUME_FROM_LAYER}"
-      echo "      resuming with layers: $LAYERS_FOR_CROSSLAYER"
-    fi
-  fi
-fi
 
 if (( START_STEP <= 3 )); then
   if [[ ! -f "$TRAIN_TXT" ]]; then
     echo "Missing train data required for step 3: $TRAIN_TXT" >&2
     exit 1
   fi
-  echo "[3/4] Running cross-layer analysis on layers: $LAYERS_FOR_CROSSLAYER"
+  echo "[3/4] Running cross-layer analysis on layers: $ALL_LAYERS"
   python crosslayer_lingualens.py \
     --model-path "$MODEL_PATH" \
     --sae-path-template "$SAE_PATH_TEMPLATE" \
-    --layers "$LAYERS_FOR_CROSSLAYER" \
+    --layers "$ALL_LAYERS" \
     --feature-file "$TRAIN_TXT" \
     --output-dir "$CROSSLAYER_DIR" \
     --top-k "$TOP_K" \
@@ -304,6 +272,7 @@ if (( START_STEP <= 3 )); then
     --normalization "$NORMALIZATION" \
     --batch-size "$BATCH_SIZE" \
     --torch-dtype "$TORCH_DTYPE" \
+    --resume \
     "${DEVICE_ARGS[@]}"
 else
   echo "[3/4] Skipped cross-layer analysis (--start-step=$START_STEP)"

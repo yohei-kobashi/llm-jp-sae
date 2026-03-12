@@ -121,6 +121,68 @@ class BaseTrainSaeLinguisticAnalyzer:
         progress.finish()
         return results
 
+    def analyze_feature_layer(
+        self,
+        feature_file: str,
+        layer_idx: int,
+        top_k: int = 10,
+        layer_position: Optional[int] = None,
+        total_layers: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        lines = load_text_data(feature_file)
+        feature_name = os.path.splitext(os.path.basename(feature_file))[0]
+        layer_label = (
+            f"[layer {layer_position}/{total_layers}]"
+            if layer_position is not None and total_layers is not None
+            else "[layer]"
+        )
+        print(f"{layer_label} start: layer={layer_idx}, top_k={top_k}")
+        layer_start = time.perf_counter()
+
+        layer_stats = self._analyze_single_layer(lines, layer_idx)
+        layer_result: Dict[str, Any] = {
+            "feature_file": feature_file,
+            "total_examples": len(lines),
+            "layers_analyzed": [layer_idx],
+            "top_k": top_k,
+            "layer_results": {},
+            "unified_results": [],
+        }
+
+        if layer_stats:
+            top_features = get_top_features_by_frc(layer_stats, top_k)
+            layer_result["layer_results"][layer_idx] = {
+                "total_base_vectors": len(layer_stats),
+                "top_features": top_features,
+                "full_stats": layer_stats,
+            }
+            for base_vector, _ in top_features[:3]:
+                stats = layer_stats[base_vector]
+                layer_result["unified_results"].append(
+                    {
+                        "feature": feature_name,
+                        "layer": layer_idx,
+                        "base_vector": int(base_vector),
+                        "ps": stats["ps"],
+                        "pn": stats["pn"],
+                        "frc": stats["frc"],
+                        "avg_max_activation": stats["avg_max_activation"],
+                    }
+                )
+
+            top_frc = float(top_features[0][1]) if top_features else float("nan")
+            print(
+                f"{layer_label} done: layer={layer_idx}, base_vectors={len(layer_stats)}, "
+                f"top_frc={top_frc:.4f}, elapsed={time.perf_counter() - layer_start:.1f}s"
+            )
+        else:
+            print(
+                f"{layer_label} done: layer={layer_idx}, base_vectors=0, "
+                f"elapsed={time.perf_counter() - layer_start:.1f}s"
+            )
+
+        return layer_result
+
     def batch_analyze_features(
         self,
         feature_files: List[str],

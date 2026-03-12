@@ -438,12 +438,17 @@ def _select_best_intervention_candidate(crosslayer_results: Dict[str, Any]) -> D
 
             if best is None or frc > best["frc"]:
                 best = {
-                    "base_vector": base_vec,
+                    "base_vectors": [base_vec],
                     "layer_idx": layer_idx,
                     "frc": frc,
                 }
 
     if best is not None:
+        layer_results = crosslayer_results.get("base_results", {}).get("layer_results", {})
+        result = layer_results.get(best["layer_idx"], layer_results.get(str(best["layer_idx"]), {}))
+        top_features = result.get("top_features", [])
+        if top_features:
+            best["base_vectors"] = [int(base_vec) for base_vec, _ in top_features[:3]]
         return best
 
     layer_results = crosslayer_results.get("base_results", {}).get("layer_results", {})
@@ -453,7 +458,7 @@ def _select_best_intervention_candidate(crosslayer_results: Dict[str, Any]) -> D
             continue
         base_vec, frc = top_features[0]
         return {
-            "base_vector": int(base_vec),
+            "base_vectors": [int(curr_base_vec) for curr_base_vec, _ in top_features[:3]],
             "layer_idx": int(layer_str),
             "frc": float(frc),
         }
@@ -482,7 +487,7 @@ def _select_per_layer_intervention_candidates(
         base_vec, frc = top_features[0]
         candidates.append(
             {
-                "base_vector": int(base_vec),
+                "base_vectors": [int(curr_base_vec) for curr_base_vec, _ in top_features[:3]],
                 "layer_idx": int(layer_idx),
                 "frc": float(frc),
             }
@@ -543,7 +548,7 @@ def _run_single_candidate(
         return {
             "cross_json": args.crosslayer_json,
             "selected_layer_idx": candidate["layer_idx"],
-            "selected_base_vector": candidate["base_vector"],
+            "selected_base_vectors": candidate["base_vectors"],
             "selected_frc": candidate["frc"],
             "sae_path": args.sae_path_template.format(candidate["layer_idx"]),
             "resume_status": "skipped_completed",
@@ -563,7 +568,7 @@ def _run_single_candidate(
     selection_meta = {
         "cross_json": args.crosslayer_json,
         "selected_layer_idx": candidate["layer_idx"],
-        "selected_base_vector": candidate["base_vector"],
+        "selected_base_vectors": candidate["base_vectors"],
         "selected_frc": candidate["frc"],
         "sae_path": sae_path,
         "input_prompts": input_prompts,
@@ -583,11 +588,11 @@ def _run_single_candidate(
 
     try:
         resolved_experiment_name = experiment_name or (
-            f"intervention_layer{candidate['layer_idx']}_bv{candidate['base_vector']}"
+            f"intervention_layer{candidate['layer_idx']}_bv{'-'.join(map(str, candidate['base_vectors']))}"
         )
         intervener.run_intervention_experiment(
             input_prompt=prompt_text,
-            intervention_indices=[candidate["base_vector"]],
+            intervention_indices=candidate["base_vectors"],
             output_path=output_path,
             num_generations=args.num_generations,
             max_new_tokens=args.max_new_tokens,
@@ -599,7 +604,7 @@ def _run_single_candidate(
 
     print(
         "Selected intervention target: "
-        f"layer={candidate['layer_idx']}, base_vector={candidate['base_vector']}, frc={candidate['frc']}"
+        f"layer={candidate['layer_idx']}, base_vectors={candidate['base_vectors']}, frc={candidate['frc']}"
     )
     print(f"Selection metadata saved to {selection_path}")
     return selection_meta
@@ -733,7 +738,7 @@ def main() -> int:
             args.output_dir, f"layer{candidate['layer_idx']}_intervention.txt"
         )
         experiment_name = args.experiment_name or (
-            f"intervention_layer{candidate['layer_idx']}_bv{candidate['base_vector']}"
+            f"intervention_layer{candidate['layer_idx']}_bv{'-'.join(map(str, candidate['base_vectors']))}"
         )
         selection_meta = _run_single_candidate(
             args=args,

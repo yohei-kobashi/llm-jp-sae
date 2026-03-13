@@ -21,6 +21,7 @@ Usage:
     [--batch-size 8] \
     [--torch-dtype bfloat16] \
     [--device cuda:0] \
+    [--random-seed 42] \
     [--num-generations 5] \
     [--max-new-tokens 100] \
     [--temperature 0.7]
@@ -55,6 +56,7 @@ NORMALIZATION="Scalar"
 BATCH_SIZE="32"
 TORCH_DTYPE="bfloat16"
 DEVICE=""
+RANDOM_SEED=""
 NUM_GENERATIONS="5"
 MAX_NEW_TOKENS="100"
 TEMPERATURE="0.7"
@@ -121,6 +123,10 @@ while [[ $# -gt 0 ]]; do
       DEVICE="$2"
       shift 2
       ;;
+    --random-seed)
+      RANDOM_SEED="$2"
+      shift 2
+      ;;
     --num-generations)
       NUM_GENERATIONS="$2"
       shift 2
@@ -154,6 +160,10 @@ fi
 if [[ ! "$START_STEP" =~ ^[1-4]$ ]]; then
   echo "--start-step must be one of: 1, 2, 3, 4" >&2
   exit 1
+fi
+
+if [[ -z "$RANDOM_SEED" ]]; then
+  RANDOM_SEED="$SEED"
 fi
 
 TARGET_SLUG="${TARGET// /_}"
@@ -302,30 +312,23 @@ if [[ ! -f "$TEST_TXT" ]]; then
 fi
 
 echo "[4/4] Running layer-wise interventions with test prompts"
-for layer in "${LAYER_ARRAY[@]}"; do
-  LAYER_JSON="$CROSSLAYER_DIR/${FEATURE_NAME}_layer${layer}_evolution.json"
-  if [[ ! -f "$LAYER_JSON" ]]; then
-    echo "Missing crosslayer JSON for intervention: $LAYER_JSON" >&2
-    exit 1
-  fi
-
-  echo "      layer ${layer}"
-  python intervener_lingualens.py \
-    --model-path "$MODEL_PATH" \
-    --sae-path-template "$SAE_PATH_TEMPLATE" \
-    --crosslayer-json "$LAYER_JSON" \
-    --output-dir "$INTERVENTION_DIR" \
-    --selection-mode per-layer \
-    --resume \
-    --prompt-file "$TEST_TXT" \
-    --k "$K" \
-    --normalization "$NORMALIZATION" \
-    --torch-dtype "$TORCH_DTYPE" \
-    --num-generations "$NUM_GENERATIONS" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --temperature "$TEMPERATURE" \
-    "${DEVICE_ARGS[@]}"
-done
+python intervener_lingualens.py \
+  --model-path "$MODEL_PATH" \
+  --sae-path-template "$SAE_PATH_TEMPLATE" \
+  --crosslayer-json "$CROSSLAYER_DIR" \
+  --output-dir "$INTERVENTION_DIR" \
+  --selection-mode per-layer \
+  --resume \
+  --prompt-file "$TEST_TXT" \
+  --k "$K" \
+  --normalization "$NORMALIZATION" \
+  --torch-dtype "$TORCH_DTYPE" \
+  --batch-size "$BATCH_SIZE" \
+  --random-seed "$RANDOM_SEED" \
+  --num-generations "$NUM_GENERATIONS" \
+  --max-new-tokens "$MAX_NEW_TOKENS" \
+  --temperature "$TEMPERATURE" \
+  "${DEVICE_ARGS[@]}"
 
 echo "Finished."
 echo "Train data: $TRAIN_TXT"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 from glob import glob
 from typing import Any, Dict, List, Optional, Tuple
@@ -151,12 +152,30 @@ class Intervener:
         if self.model is not None:
             self.model.update_intervention_config(config)
 
+    def get_num_latents(self) -> int:
+        if self.model is None:
+            raise RuntimeError("Model is not loaded.")
+        return int(self.model.sae.W_dec.shape[0])
+
     def _generate_with_intervention(
         self,
         inputs: Dict[str, torch.Tensor],
         max_new_tokens: int,
         temperature: float,
     ) -> str:
+        outputs = self._generate_batch_with_intervention(
+            inputs=inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+        )
+        return outputs[0]
+
+    def _generate_batch_with_intervention(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        max_new_tokens: int,
+        temperature: float,
+    ) -> List[str]:
         try:
             generated_ids = self.model.generate(
                 **inputs,
@@ -165,10 +184,13 @@ class Intervener:
                 do_sample=True if temperature > 0 else False,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
-            output_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-            return output_text
+            return [
+                self.tokenizer.decode(sequence, skip_special_tokens=True)
+                for sequence in generated_ids
+            ]
         except Exception as exc:
-            return f"[GENERATION ERROR]: {str(exc)}"
+            batch_size = int(inputs["input_ids"].shape[0])
+            return [f"[GENERATION ERROR]: {str(exc)}"] * batch_size
 
     def run_intervention_experiment(
         self,
@@ -179,17 +201,24 @@ class Intervener:
         max_new_tokens: int = 100,
         temperature: float = 1.0,
         experiment_name: Optional[str] = None,
+        random_seed: int = 0,
+        batch_size: int = 8,
     ) -> Dict[str, Any]:
         input_prompts = _split_prompts(input_prompt)
+        rng = random.Random(random_seed)
+        num_latents = self.get_num_latents()
+        batch_size = max(1, int(batch_size))
         experiment_results = {
             "experiment_name": experiment_name or "intervention_experiment",
             "input_prompt": input_prompt,
             "input_prompts": input_prompts,
-            "intervention_indices": intervention_indices,
+            "target_intervention_indices": intervention_indices,
             "num_generations": num_generations,
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
             "layer_idx": self.layer_idx,
+            "random_seed": random_seed,
+            "batch_size": batch_size,
             "prompt_results": [],
         }
 
@@ -201,95 +230,132 @@ class Intervener:
             for prompt_idx, prompt in enumerate(input_prompts, start=1):
                 out_file.write(f"{prompt_idx}. {prompt}\n")
             out_file.write("\n")
-            out_file.write(f"[INTERVENTION INDICES]: {intervention_indices}\n\n")
+            out_file.write(f"[TARGET INTERVENTION INDICES]: {intervention_indices}\n\n")
             out_file.write(f"[LAYER IDX]: {self.layer_idx}\n\n")
+            out_file.write(f"[BATCH SIZE]: {batch_size}\n\n")
+            out_file.write(
+                "[PROMPT RULE]: odd lines -> ablation, even lines -> enhancement\n\n"
+            )
 
         progress = ProgressLogger(
-            len(input_prompts) * num_generations * 3,
+            len(input_prompts) * num_generations * 2,
             "Running intervention experiment",
         )
-        encoded_prompts = [
-            self.tokenizer(prompt, return_tensors="pt").to(self.device)
-            for prompt in input_prompts
-        ]
-
-        with open(output_path, "a", encoding="utf-8") as out_file:
-            for prompt_idx, (prompt, inputs) in enumerate(
-                zip(input_prompts, encoded_prompts), start=1
-            ):
-                prompt_result = {
+        prompt_entries = []
+        prompt_lines_by_idx: Dict[int, List[str]] = {}
+        for prompt_idx, prompt in enumerate(input_prompts, start=1):
+            intervention_mode = "ablation" if prompt_idx % 2 == 1 else "enhancement"
+            prompt_entries.append(
+                {
                     "prompt_index": prompt_idx,
                     "input_prompt": prompt,
-                    "conditions": {"ablation": [], "enhancement": [], "control": []},
+                    "intervention_type": intervention_mode,
+                    "target_indices": list(intervention_indices),
+                    "generations": [],
                 }
-                prompt_lines = [f"=== Prompt {prompt_idx} ===\n", prompt + "\n\n"]
-
-                for generation in range(1, num_generations + 1):
-                    print(f"Starting prompt {prompt_idx}, generation {generation}...")
-                    prompt_lines.append(
-                        f"--- Prompt {prompt_idx} / Generation {generation} ---\n"
-                    )
-                    ablation_config = InterventionConfig(
-                        intervention=True,
-                        intervention_mode="set",
-                        intervention_indices=intervention_indices,
-                        intervention_value=0.0,
-                        prompt_only=False,
-                    )
-                    self.update_intervention_config(ablation_config)
-                    ablation_output = self._generate_with_intervention(
-                        inputs, max_new_tokens, temperature
-                    )
-                    prompt_lines.append("[Ablation (set value=0)]:\n")
-                    prompt_lines.append(ablation_output + "\n\n")
-                    progress.update()
-
-                    enhancement_config = InterventionConfig(
-                        intervention=True,
-                        intervention_mode="set",
-                        intervention_indices=intervention_indices,
-                        intervention_value=10.0,
-                        prompt_only=False,
-                    )
-                    self.update_intervention_config(enhancement_config)
-                    enhancement_output = self._generate_with_intervention(
-                        inputs, max_new_tokens, temperature
-                    )
-                    prompt_lines.append("[Enhancement (set value=10)]:\n")
-                    prompt_lines.append(enhancement_output + "\n\n")
-                    progress.update()
-
-                    control_config = InterventionConfig(
-                        intervention=True,
-                        intervention_mode="multiply",
-                        intervention_indices=intervention_indices,
-                        intervention_value=1.0,
-                        prompt_only=False,
-                    )
-                    self.update_intervention_config(control_config)
-                    control_output = self._generate_with_intervention(
-                        inputs, max_new_tokens, temperature
-                    )
-                    prompt_lines.append("[Control (multiply value=1)]:\n")
-                    prompt_lines.append(control_output + "\n\n")
-                    progress.update()
-
-                    prompt_result["conditions"]["ablation"].append(ablation_output)
-                    prompt_result["conditions"]["enhancement"].append(enhancement_output)
-                    prompt_result["conditions"]["control"].append(control_output)
-                    print(
-                        f"Prompt {prompt_idx}, generation {generation} completed and buffered "
-                        f"for {output_path}."
-                    )
-
-                out_file.write("".join(prompt_lines))
-                out_file.flush()
-                experiment_results["prompt_results"].append(prompt_result)
-
-        if len(experiment_results["prompt_results"]) == 1:
-            experiment_results["conditions"] = experiment_results["prompt_results"][0][
-                "conditions"
+            )
+            prompt_lines_by_idx[prompt_idx] = [
+                f"=== Prompt {prompt_idx} ===\n",
+                prompt + "\n\n",
+                f"[INTERVENTION TYPE]: {intervention_mode}\n",
+                f"[TARGET INDICES]: {intervention_indices}\n\n",
             ]
+
+        grouped_entries = {
+            "ablation": [entry for entry in prompt_entries if entry["intervention_type"] == "ablation"],
+            "enhancement": [
+                entry for entry in prompt_entries if entry["intervention_type"] == "enhancement"
+            ],
+        }
+        target_values = {"ablation": 0.0, "enhancement": 10.0}
+
+        for generation in range(1, num_generations + 1):
+            for intervention_mode in ("ablation", "enhancement"):
+                mode_entries = grouped_entries[intervention_mode]
+                if not mode_entries:
+                    continue
+
+                target_value = target_values[intervention_mode]
+                for batch_start in range(0, len(mode_entries), batch_size):
+                    batch_entries = mode_entries[batch_start : batch_start + batch_size]
+                    batch_prompts = [entry["input_prompt"] for entry in batch_entries]
+                    batch_indices = [entry["prompt_index"] for entry in batch_entries]
+                    print(
+                        f"Starting {intervention_mode} generation {generation} for prompts "
+                        f"{batch_indices}..."
+                    )
+                    batch_inputs = self.tokenizer(
+                        batch_prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                    ).to(self.device)
+
+                    target_config = InterventionConfig(
+                        intervention=True,
+                        intervention_mode="set",
+                        intervention_indices=intervention_indices,
+                        intervention_value=target_value,
+                        prompt_only=False,
+                    )
+                    self.update_intervention_config(target_config)
+                    target_outputs = self._generate_batch_with_intervention(
+                        batch_inputs, max_new_tokens, temperature
+                    )
+                    progress.update(len(batch_entries))
+
+                    random_indices = _sample_random_intervention_indices(
+                        num_latents=num_latents,
+                        num_indices=len(intervention_indices),
+                        excluded_indices=intervention_indices,
+                        rng=rng,
+                    )
+                    random_config = InterventionConfig(
+                        intervention=True,
+                        intervention_mode="set",
+                        intervention_indices=random_indices,
+                        intervention_value=target_value,
+                        prompt_only=False,
+                    )
+                    self.update_intervention_config(random_config)
+                    random_outputs = self._generate_batch_with_intervention(
+                        batch_inputs, max_new_tokens, temperature
+                    )
+                    progress.update(len(batch_entries))
+
+                    for entry, target_output, random_output in zip(
+                        batch_entries, target_outputs, random_outputs
+                    ):
+                        prompt_lines = prompt_lines_by_idx[entry["prompt_index"]]
+                        prompt_lines.append(
+                            f"--- Prompt {entry['prompt_index']} / Generation {generation} ---\n"
+                        )
+                        prompt_lines.append(f"[Random INDICES]: {random_indices}\n")
+                        prompt_lines.append(f"[Target {intervention_mode}]:\n")
+                        prompt_lines.append(target_output + "\n\n")
+                        prompt_lines.append(f"[Random {intervention_mode}]:\n")
+                        prompt_lines.append(random_output + "\n\n")
+                        entry["generations"].append(
+                            {
+                                "generation": generation,
+                                "intervention_type": intervention_mode,
+                                "target_indices": list(intervention_indices),
+                                "random_indices": list(random_indices),
+                                "target_output": target_output,
+                                "random_output": random_output,
+                            }
+                        )
+                        print(
+                            f"Prompt {entry['prompt_index']}, generation {generation} completed "
+                            f"and buffered for {output_path}."
+                        )
+
+        experiment_results["prompt_results"] = prompt_entries
+
+        with open(output_path, "a", encoding="utf-8") as out_file:
+            for entry in prompt_entries:
+                out_file.write("".join(prompt_lines_by_idx[entry["prompt_index"]]))
+                out_file.flush()
 
         progress.finish()
 
@@ -420,6 +486,21 @@ def _split_prompts(prompt_text: str) -> List[str]:
     if not prompts:
         raise ValueError("Prompt text is empty.")
     return prompts
+
+
+def _sample_random_intervention_indices(
+    num_latents: int,
+    num_indices: int,
+    excluded_indices: List[int],
+    rng: random.Random,
+) -> List[int]:
+    all_indices = set(range(num_latents))
+    candidate_indices = sorted(all_indices - {int(idx) for idx in excluded_indices})
+    if len(candidate_indices) < num_indices:
+        raise ValueError(
+            f"Not enough latent indices to sample {num_indices} random interventions."
+        )
+    return sorted(rng.sample(candidate_indices, num_indices))
 
 
 def _collect_crosslayer_json_paths(crosslayer_path: str) -> List[str]:
@@ -696,6 +777,8 @@ def _run_single_candidate(
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             experiment_name=resolved_experiment_name,
+            random_seed=args.random_seed,
+            batch_size=args.batch_size,
         )
     finally:
         intervener.clear_cache()
@@ -795,6 +878,18 @@ def main() -> int:
         "--resume",
         action="store_true",
         help="Skip runs whose output txt/results/selection files already exist.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=0,
+        help="Seed used to sample comparison intervention indices.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Number of prompts to generate together for the same intervention setting.",
     )
 
     args = parser.parse_args()

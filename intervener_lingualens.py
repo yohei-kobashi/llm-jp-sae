@@ -12,10 +12,14 @@ import json
 import os
 import random
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from openai import OpenAI
+from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from LinguaLens.lingualens.utils import (
@@ -25,6 +29,8 @@ from LinguaLens.lingualens.utils import (
     setup_tokenizer,
 )
 from util import InterventionConfig, TransformerWithSae
+
+JUDGE_MODEL = "gpt-5-mini"
 
 
 class Intervener:
@@ -203,6 +209,8 @@ class Intervener:
         experiment_name: Optional[str] = None,
         random_seed: int = 0,
         batch_size: int = 8,
+        alpha: Optional[float] = None,
+        intervention_feature_weights: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         input_prompts = _split_prompts(input_prompt)
         rng = random.Random(random_seed)
@@ -219,6 +227,8 @@ class Intervener:
             "layer_idx": self.layer_idx,
             "random_seed": random_seed,
             "batch_size": batch_size,
+            "alpha": alpha,
+            "intervention_feature_weights": intervention_feature_weights,
             "prompt_results": [],
         }
 
@@ -231,6 +241,12 @@ class Intervener:
                 out_file.write(f"{prompt_idx}. {prompt}\n")
             out_file.write("\n")
             out_file.write(f"[TARGET INTERVENTION INDICES]: {intervention_indices}\n\n")
+            if intervention_feature_weights is not None:
+                out_file.write(
+                    f"[TARGET INTERVENTION WEIGHTS]: {intervention_feature_weights}\n\n"
+                )
+            if alpha is not None:
+                out_file.write(f"[ALPHA]: {alpha}\n\n")
             out_file.write(f"[LAYER IDX]: {self.layer_idx}\n\n")
             out_file.write(f"[BATCH SIZE]: {batch_size}\n\n")
             out_file.write(
@@ -276,6 +292,14 @@ class Intervener:
                     continue
 
                 target_value = target_values[intervention_mode]
+                weighted_intervention_values = None
+                if intervention_feature_weights is not None:
+                    direction = -1.0 if intervention_mode == "ablation" else 1.0
+                    resolved_alpha = 1.0 if alpha is None else float(alpha)
+                    weighted_intervention_values = [
+                        direction * resolved_alpha * float(weight)
+                        for weight in intervention_feature_weights
+                    ]
                 for batch_start in range(0, len(mode_entries), batch_size):
                     batch_entries = mode_entries[batch_start : batch_start + batch_size]
                     batch_prompts = [entry["input_prompt"] for entry in batch_entries]
@@ -293,9 +317,12 @@ class Intervener:
 
                     target_config = InterventionConfig(
                         intervention=True,
-                        intervention_mode="set",
+                        intervention_mode="add"
+                        if weighted_intervention_values is not None
+                        else "set",
                         intervention_indices=intervention_indices,
                         intervention_value=target_value,
+                        intervention_weights=weighted_intervention_values,
                         prompt_only=False,
                     )
                     self.update_intervention_config(target_config)
@@ -312,9 +339,12 @@ class Intervener:
                     )
                     random_config = InterventionConfig(
                         intervention=True,
-                        intervention_mode="set",
+                        intervention_mode="add"
+                        if weighted_intervention_values is not None
+                        else "set",
                         intervention_indices=random_indices,
                         intervention_value=target_value,
+                        intervention_weights=weighted_intervention_values,
                         prompt_only=False,
                     )
                     self.update_intervention_config(random_config)
@@ -331,6 +361,10 @@ class Intervener:
                             f"--- Prompt {entry['prompt_index']} / Generation {generation} ---\n"
                         )
                         prompt_lines.append(f"[Random INDICES]: {random_indices}\n")
+                        if weighted_intervention_values is not None:
+                            prompt_lines.append(
+                                f"[WEIGHTED INTERVENTION VALUES]: {weighted_intervention_values}\n"
+                            )
                         prompt_lines.append(f"[Target {intervention_mode}]:\n")
                         prompt_lines.append(target_output + "\n\n")
                         prompt_lines.append(f"[Random {intervention_mode}]:\n")
@@ -340,6 +374,8 @@ class Intervener:
                                 "generation": generation,
                                 "intervention_type": intervention_mode,
                                 "target_indices": list(intervention_indices),
+                                "target_weights": list(intervention_feature_weights or []),
+                                "weighted_intervention_values": list(weighted_intervention_values or []),
                                 "random_indices": list(random_indices),
                                 "target_output": target_output,
                                 "random_output": random_output,
@@ -470,6 +506,90 @@ class Intervener:
             torch.cuda.empty_cache()
 
 
+class InterventionJudgeResult(BaseModel):
+    target_control_success: bool
+    grammar_preserved: bool
+    meaning_preserved: bool
+    target_control_reason: str
+    grammar_reason: str
+    meaning_reason: str
+
+
+JUDGE_SYSTEM_PROMPT = (
+    "You are a strict judge for intervention outputs on English modality or supposition control.\n"
+    "Evaluate the output against exactly three criteria:\n"
+    "1. target_control_success: Whether the requested ablation or enhancement of the target modality succeeded.\n"
+    "2. grammar_preserved: Whether the output remains grammatical and coherent English.\n"
+    "3. meaning_preserved: Whether the non-target meaning is preserved aside from the intended modality change.\n"
+    "Be strict. Added content, semantic drift, contradiction, or malformed English should be penalized.\n"
+    "Return only JSON matching the schema."
+)
+
+
+def _strip_prompt_prefix(prompt: str, output_text: str) -> str:
+    normalized_prompt = prompt.strip()
+    normalized_output = output_text.strip()
+    if normalized_output.startswith(normalized_prompt):
+        stripped = normalized_output[len(normalized_prompt):].strip()
+        if stripped:
+            return stripped
+    return normalized_output
+
+
+def _build_judge_user_prompt(
+    target_modality: str,
+    intervention_type: str,
+    input_prompt: str,
+    output_text: str,
+) -> str:
+    return (
+        f"Target modality: {target_modality}\n"
+        f"Requested intervention: {intervention_type}\n"
+        "Interpretation of success:\n"
+        "- ablation: the target modality should be weakened, removed, or made less explicit than in the input.\n"
+        "- enhancement: the target modality should be strengthened, restored, or made more explicit than in the input.\n"
+        "Judge the output text itself. If the model repeats the input and then adds continuation, judge the final output as produced.\n"
+        f"Input text:\n{input_prompt}\n\n"
+        f"Output text:\n{output_text}\n"
+    )
+
+
+def _call_judge_with_retries(
+    client: OpenAI,
+    target_modality: str,
+    intervention_type: str,
+    input_prompt: str,
+    output_text: str,
+    max_retries: int = 5,
+    base_sleep: float = 1.0,
+) -> InterventionJudgeResult:
+    user_prompt = _build_judge_user_prompt(
+        target_modality=target_modality,
+        intervention_type=intervention_type,
+        input_prompt=input_prompt,
+        output_text=output_text,
+    )
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.responses.parse(
+                model=JUDGE_MODEL,
+                input=[
+                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                text_format=InterventionJudgeResult,
+            )
+            return resp.output_parsed
+        except Exception as exc:
+            last_err = exc
+            sleep_s = min(base_sleep * (2 ** (attempt - 1)), 30.0) + 0.1 * attempt
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"Judge request failed after {max_retries} retries: {last_err}") from last_err
+
+
 def _parse_torch_dtype(dtype_name: str) -> torch.dtype:
     mapping = {
         "bfloat16": torch.bfloat16,
@@ -525,6 +645,32 @@ def _load_crosslayer_jsons(crosslayer_path: str) -> List[Tuple[str, Dict[str, An
     return loaded
 
 
+def _get_intervention_plan(result: Dict[str, Any]) -> Tuple[List[int], float, List[float]]:
+    intervention_features = result.get("intervention_features", [])
+    feature_weights = result.get("intervention_feature_weights", [])
+    if intervention_features:
+        selected = {int(base_vec) for base_vec in intervention_features}
+        ordered_entries = [
+            item for item in feature_weights if int(item.get("base_vector")) in selected
+        ]
+        ordered_vectors = [int(item["base_vector"]) for item in ordered_entries]
+        ordered_weights = [float(item.get("weight", 0.0)) for item in ordered_entries]
+        if not ordered_vectors:
+            ordered_vectors = [int(base_vec) for base_vec in intervention_features]
+            ordered_weights = [0.0 for _ in ordered_vectors]
+        score = max(
+            (abs(float(item.get("weight", 0.0))) for item in feature_weights if int(item.get("base_vector")) in selected),
+            default=0.0,
+        )
+        return ordered_vectors, float(score), ordered_weights
+
+    top_features = result.get("top_features", [])
+    if not top_features:
+        return [], float("-inf"), []
+    base_vec, score = top_features[0]
+    return [int(curr_base_vec) for curr_base_vec, _ in top_features[:3]], float(score), []
+
+
 def _select_best_intervention_candidate(crosslayer_results: Dict[str, Any]) -> Dict[str, Any]:
     if "layer_candidates" in crosslayer_results:
         best = None
@@ -567,21 +713,23 @@ def _select_best_intervention_candidate(crosslayer_results: Dict[str, Any]) -> D
     if best is not None:
         layer_results = crosslayer_results.get("base_results", {}).get("layer_results", {})
         result = layer_results.get(best["layer_idx"], layer_results.get(str(best["layer_idx"]), {}))
-        top_features = result.get("top_features", [])
-        if top_features:
-            best["base_vectors"] = [int(base_vec) for base_vec, _ in top_features[:3]]
+        base_vectors, selection_score, feature_weights = _get_intervention_plan(result)
+        if base_vectors:
+            best["base_vectors"] = base_vectors
+            best["selection_score"] = selection_score
+            best["feature_weights"] = feature_weights
         return best
 
     layer_results = crosslayer_results.get("base_results", {}).get("layer_results", {})
     for layer_str, result in layer_results.items():
-        top_features = result.get("top_features", [])
-        if not top_features:
+        base_vectors, selection_score, feature_weights = _get_intervention_plan(result)
+        if not base_vectors:
             continue
-        base_vec, frc = top_features[0]
         return {
-            "base_vectors": [int(curr_base_vec) for curr_base_vec, _ in top_features[:3]],
+            "base_vectors": base_vectors,
             "layer_idx": int(layer_str),
-            "frc": float(frc),
+            "frc": float(selection_score),
+            "feature_weights": feature_weights,
         }
 
     raise RuntimeError("No intervention candidate found in crosslayer results.")
@@ -638,15 +786,15 @@ def _select_per_layer_intervention_candidates(
 
     for layer_idx in sorted(set(sortable_layers)):
         result = layer_results.get(layer_idx, layer_results.get(str(layer_idx), {}))
-        top_features = result.get("top_features", [])
-        if not top_features:
+        base_vectors, selection_score, feature_weights = _get_intervention_plan(result)
+        if not base_vectors:
             continue
-        base_vec, frc = top_features[0]
         candidates.append(
             {
-                "base_vectors": [int(curr_base_vec) for curr_base_vec, _ in top_features[:3]],
+                "base_vectors": base_vectors,
                 "layer_idx": int(layer_idx),
-                "frc": float(frc),
+                "frc": float(selection_score),
+                "feature_weights": feature_weights,
             }
         )
 
@@ -676,6 +824,14 @@ def _select_per_layer_intervention_candidates_from_many(
 
     candidates.sort(key=lambda item: int(item["layer_idx"]))
     return candidates
+
+
+def _save_json(path: str, payload: Dict[str, Any]) -> str:
+    output_dir = os.path.dirname(path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
 
 
 def _save_selection_metadata(
@@ -711,12 +867,257 @@ def _load_existing_selection(output_path: str) -> Optional[Dict[str, Any]]:
         return json.load(f)
 
 
+def _load_results_json(output_path: str) -> Dict[str, Any]:
+    results_path = _get_result_paths(output_path)["results_json"]
+    with open(results_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _judge_output_path(output_path: str) -> str:
+    return output_path.replace(".txt", "_judge.json")
+
+
+def _slugify_alpha(alpha: float) -> str:
+    return str(alpha).replace("-", "neg_").replace(".", "p")
+
+
+def _evaluate_intervention_results_with_judge(
+    experiment_results: Dict[str, Any],
+    target_modality: str,
+    max_workers: int = 8,
+) -> Dict[str, Any]:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise EnvironmentError("OPENAI_API_KEY is not set.")
+
+    tasks = []
+    for prompt_entry in experiment_results.get("prompt_results", []):
+        for generation_entry in prompt_entry.get("generations", []):
+            target_output = generation_entry.get("target_output", "")
+            input_prompt = prompt_entry.get("input_prompt", "")
+            tasks.append(
+                {
+                    "prompt_index": int(prompt_entry.get("prompt_index", -1)),
+                    "generation": int(generation_entry.get("generation", -1)),
+                    "intervention_type": generation_entry.get(
+                        "intervention_type",
+                        prompt_entry.get("intervention_type", "unknown"),
+                    ),
+                    "input_prompt": input_prompt,
+                    "output_text": target_output,
+                    "continuation_only_text": _strip_prompt_prefix(input_prompt, target_output),
+                }
+            )
+
+    evaluations: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    def _run_single_judge(task: Dict[str, Any]) -> Dict[str, Any]:
+        client = OpenAI()
+        verdict = _call_judge_with_retries(
+            client=client,
+            target_modality=target_modality,
+            intervention_type=task["intervention_type"],
+            input_prompt=task["input_prompt"],
+            output_text=task["output_text"],
+        )
+        return {
+            **task,
+            "judge": verdict.model_dump(),
+            "all_criteria_pass": bool(
+                verdict.target_control_success
+                and verdict.grammar_preserved
+                and verdict.meaning_preserved
+            ),
+        }
+
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+        futures = {executor.submit(_run_single_judge, task): task for task in tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                evaluations.append(future.result())
+            except Exception as exc:
+                errors.append(
+                    {
+                        "prompt_index": task["prompt_index"],
+                        "generation": task["generation"],
+                        "intervention_type": task["intervention_type"],
+                        "error": str(exc),
+                    }
+                )
+
+    evaluations.sort(key=lambda item: (item["prompt_index"], item["generation"]))
+
+    summary = {
+        "target_modality": target_modality,
+        "num_evaluated": len(evaluations),
+        "num_errors": len(errors),
+        "all_criteria_pass_count": sum(
+            1 for item in evaluations if item["all_criteria_pass"]
+        ),
+        "target_control_success_count": sum(
+            1 for item in evaluations if item["judge"]["target_control_success"]
+        ),
+        "grammar_preserved_count": sum(
+            1 for item in evaluations if item["judge"]["grammar_preserved"]
+        ),
+        "meaning_preserved_count": sum(
+            1 for item in evaluations if item["judge"]["meaning_preserved"]
+        ),
+        "by_intervention_type": {},
+    }
+
+    for intervention_type in ("ablation", "enhancement"):
+        subset = [
+            item for item in evaluations if item["intervention_type"] == intervention_type
+        ]
+        summary["by_intervention_type"][intervention_type] = {
+            "count": len(subset),
+            "all_criteria_pass_count": sum(
+                1 for item in subset if item["all_criteria_pass"]
+            ),
+            "target_control_success_count": sum(
+                1 for item in subset if item["judge"]["target_control_success"]
+            ),
+            "grammar_preserved_count": sum(
+                1 for item in subset if item["judge"]["grammar_preserved"]
+            ),
+            "meaning_preserved_count": sum(
+                1 for item in subset if item["judge"]["meaning_preserved"]
+            ),
+        }
+
+    return {
+        "experiment_name": experiment_results.get("experiment_name"),
+        "layer_idx": experiment_results.get("layer_idx"),
+        "alpha": experiment_results.get("alpha"),
+        "target_intervention_indices": experiment_results.get(
+            "target_intervention_indices", []
+        ),
+        "target_intervention_weights": experiment_results.get(
+            "intervention_feature_weights", []
+        ),
+        "summary": summary,
+        "evaluations": evaluations,
+        "errors": errors,
+    }
+
+
+def _run_alpha_sweep_and_test(
+    args: argparse.Namespace,
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not args.output_dir:
+        raise ValueError("--output-dir is required for alpha tuning mode.")
+    if not args.dev_prompt_file or not args.test_prompt_file:
+        raise ValueError(
+            "--dev-prompt-file and --test-prompt-file are required for alpha tuning mode."
+        )
+    if not args.target_modality:
+        raise ValueError("--target-modality is required for alpha tuning mode.")
+    if not candidate.get("feature_weights"):
+        raise ValueError(
+            "Selected intervention candidate does not contain ElasticNet weights. "
+            "Regenerate crosslayer outputs before running alpha tuning."
+        )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(args.dev_prompt_file, "r", encoding="utf-8") as f:
+        dev_prompt_text = f.read()
+    with open(args.test_prompt_file, "r", encoding="utf-8") as f:
+        test_prompt_text = f.read()
+
+    alpha_results = []
+    best_alpha_result = None
+
+    for alpha in args.alpha_values:
+        alpha_slug = _slugify_alpha(alpha)
+        output_path = os.path.join(args.output_dir, f"dev_alpha_{alpha_slug}.txt")
+        print(f"Running dev alpha sweep: alpha={alpha}")
+        selection_meta = _run_single_candidate(
+            args=args,
+            candidate=candidate,
+            prompt_text=dev_prompt_text,
+            output_path=output_path,
+            experiment_name=f"dev_alpha_{alpha_slug}",
+            alpha=alpha,
+        )
+        experiment_results = _load_results_json(output_path)
+        judge_results = _evaluate_intervention_results_with_judge(
+            experiment_results=experiment_results,
+            target_modality=args.target_modality,
+            max_workers=args.judge_max_workers,
+        )
+        judge_path = _save_json(_judge_output_path(output_path), judge_results)
+        alpha_result = {
+            "alpha": float(alpha),
+            "output_path": output_path,
+            "judge_path": judge_path,
+            "selection_meta": selection_meta,
+            "summary": judge_results["summary"],
+        }
+        alpha_results.append(alpha_result)
+
+        if best_alpha_result is None:
+            best_alpha_result = alpha_result
+            continue
+        current_pass = alpha_result["summary"]["all_criteria_pass_count"]
+        best_pass = best_alpha_result["summary"]["all_criteria_pass_count"]
+        if current_pass > best_pass or (
+            current_pass == best_pass and float(alpha) < float(best_alpha_result["alpha"])
+        ):
+            best_alpha_result = alpha_result
+
+    assert best_alpha_result is not None
+    best_alpha = float(best_alpha_result["alpha"])
+    summary_path = os.path.join(args.output_dir, "alpha_sweep_summary.json")
+    alpha_summary = {
+        "target_modality": args.target_modality,
+        "selected_alpha": best_alpha,
+        "alpha_results": alpha_results,
+    }
+    _save_json(summary_path, alpha_summary)
+
+    test_output_path = os.path.join(
+        args.output_dir, f"test_selected_alpha_{_slugify_alpha(best_alpha)}.txt"
+    )
+    print(f"Running test evaluation with selected alpha={best_alpha}")
+    test_selection = _run_single_candidate(
+        args=args,
+        candidate=candidate,
+        prompt_text=test_prompt_text,
+        output_path=test_output_path,
+        experiment_name=f"test_alpha_{_slugify_alpha(best_alpha)}",
+        alpha=best_alpha,
+    )
+    test_results = _load_results_json(test_output_path)
+    test_judge = _evaluate_intervention_results_with_judge(
+        experiment_results=test_results,
+        target_modality=args.target_modality,
+        max_workers=args.judge_max_workers,
+    )
+    test_judge_path = _save_json(_judge_output_path(test_output_path), test_judge)
+
+    final_summary = {
+        "target_modality": args.target_modality,
+        "selected_alpha": best_alpha,
+        "dev_summary_path": summary_path,
+        "test_output_path": test_output_path,
+        "test_selection": test_selection,
+        "test_judge_path": test_judge_path,
+        "test_summary": test_judge["summary"],
+    }
+    _save_json(os.path.join(args.output_dir, "test_evaluation_summary.json"), final_summary)
+    return final_summary
+
+
 def _run_single_candidate(
     args: argparse.Namespace,
     candidate: Dict[str, Any],
     prompt_text: str,
     output_path: str,
     experiment_name: Optional[str] = None,
+    alpha: Optional[float] = None,
 ) -> Dict[str, Any]:
     if args.resume and _is_completed_run(output_path):
         print(f"Skipping completed run: {output_path}")
@@ -728,8 +1129,10 @@ def _run_single_candidate(
             "cross_json": candidate.get("cross_json", args.crosslayer_json),
             "selected_layer_idx": candidate["layer_idx"],
             "selected_base_vectors": candidate["base_vectors"],
+            "selected_feature_weights": candidate.get("feature_weights", []),
             "selected_frc": candidate["frc"],
             "sae_path": args.sae_path_template.format(candidate["layer_idx"]),
+            "alpha": alpha,
             "resume_status": "skipped_completed",
         }
 
@@ -748,9 +1151,11 @@ def _run_single_candidate(
         "cross_json": candidate.get("cross_json", args.crosslayer_json),
         "selected_layer_idx": candidate["layer_idx"],
         "selected_base_vectors": candidate["base_vectors"],
+        "selected_feature_weights": candidate.get("feature_weights", []),
         "selected_frc": candidate["frc"],
         "sae_path": sae_path,
         "input_prompts": input_prompts,
+        "alpha": alpha,
         "resume_status": "executed",
     }
     selection_path = _save_selection_metadata(output_path, selection_meta)
@@ -779,6 +1184,8 @@ def _run_single_candidate(
             experiment_name=resolved_experiment_name,
             random_seed=args.random_seed,
             batch_size=args.batch_size,
+            alpha=alpha,
+            intervention_feature_weights=candidate.get("feature_weights") or None,
         )
     finally:
         intervener.clear_cache()
@@ -823,7 +1230,17 @@ def main() -> int:
         default=None,
         help="Directory to save intervention result files in per-layer mode.",
     )
-    prompt_group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "--dev-prompt-file",
+        default=None,
+        help="Dev prompt text file used for alpha tuning with the LLM judge.",
+    )
+    parser.add_argument(
+        "--test-prompt-file",
+        default=None,
+        help="Test prompt text file used for final evaluation with the selected alpha.",
+    )
+    prompt_group = parser.add_mutually_exclusive_group(required=False)
     prompt_group.add_argument(
         "--prompt",
         help="Test text used as the intervention prompt. Multiple lines are supported.",
@@ -891,12 +1308,45 @@ def main() -> int:
         default=8,
         help="Number of prompts to generate together for the same intervention setting.",
     )
+    parser.add_argument(
+        "--target-modality",
+        default=None,
+        help="Target modality string, required when running alpha tuning / judge evaluation.",
+    )
+    parser.add_argument(
+        "--alpha-values",
+        default="0.25,0.5,1.0,2.0",
+        help="Comma-separated alpha values for weighted intervention tuning.",
+    )
+    parser.add_argument(
+        "--judge-max-workers",
+        type=int,
+        default=int(os.getenv("MAX_WORKERS", "8")),
+        help="Max parallel judge requests for gpt-5-mini evaluation.",
+    )
+    parser.add_argument(
+        "--tune-alpha",
+        action="store_true",
+        help="Tune alpha on dev prompts with gpt-5-mini and evaluate the selected alpha on test prompts.",
+    )
 
     args = parser.parse_args()
     if args.selection_mode == "best" and not args.output_path:
-        raise ValueError("--output-path is required when --selection-mode=best.")
+        if not args.tune_alpha:
+            raise ValueError("--output-path is required when --selection-mode=best.")
     if args.selection_mode == "per-layer" and not args.output_dir:
         raise ValueError("--output-dir is required when --selection-mode=per-layer.")
+    args.alpha_values = [
+        float(value.strip()) for value in args.alpha_values.split(",") if value.strip()
+    ]
+    if args.tune_alpha and not args.output_dir:
+        raise ValueError("--output-dir is required when --tune-alpha is set.")
+    if not args.tune_alpha and not args.prompt and not args.prompt_file:
+        raise ValueError("Specify --prompt or --prompt-file.")
+    if args.tune_alpha and (not args.dev_prompt_file or not args.test_prompt_file):
+        raise ValueError(
+            "--dev-prompt-file and --test-prompt-file are required when --tune-alpha is set."
+        )
 
     crosslayer_entries = _load_crosslayer_jsons(args.crosslayer_json)
 
@@ -907,6 +1357,12 @@ def main() -> int:
 
     if args.selection_mode == "best":
         best = _select_best_intervention_candidate_from_many(crosslayer_entries)
+        if args.tune_alpha:
+            _run_alpha_sweep_and_test(
+                args=args,
+                candidate=best,
+            )
+            return 0
         _run_single_candidate(
             args=args,
             candidate=best,

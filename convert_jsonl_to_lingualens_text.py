@@ -46,9 +46,19 @@ def main() -> None:
         help="Output train TXT path (default: data/minimal_pairs_train.txt)",
     )
     parser.add_argument(
+        "--dev-output",
+        default="data/minimal_pairs_dev.txt",
+        help="Output dev TXT path (default: data/minimal_pairs_dev.txt)",
+    )
+    parser.add_argument(
+        "--dev-output-jsonl",
+        default="data/minimal_pairs_dev.jsonl",
+        help="Output dev JSONL path (default: data/minimal_pairs_dev.jsonl)",
+    )
+    parser.add_argument(
         "--test-output",
         default="data/minimal_pairs_test.txt",
-        help="Output test JSONL path (default: data/minimal_pairs_test.txt)",
+        help="Output test TXT path (default: data/minimal_pairs_test.txt)",
     )
     parser.add_argument(
         "--test-output-jsonl",
@@ -56,16 +66,22 @@ def main() -> None:
         help="Output test JSONL path (default: data/minimal_pairs_test.jsonl)",
     )
     parser.add_argument(
+        "--dev-ratio",
+        type=float,
+        default=0.2,
+        help="Dev split ratio in [0.0, 1.0] (default: 0.2)",
+    )
+    parser.add_argument(
         "--test-ratio",
         type=float,
-        default=0.1,
-        help="Test split ratio in [0.0, 1.0] (default: 0.1)",
+        default=0.2,
+        help="Test split ratio in [0.0, 1.0] (default: 0.2)",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for reproducible train/test split (default: 42)",
+        help="Random seed for reproducible train/dev/test split (default: 42)",
     )
     parser.add_argument(
         "--target",
@@ -75,10 +91,16 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if not (0.0 <= args.dev_ratio <= 1.0):
+        raise ValueError("--dev-ratio must be in [0.0, 1.0].")
     if not (0.0 <= args.test_ratio <= 1.0):
         raise ValueError("--test-ratio must be in [0.0, 1.0].")
+    if args.dev_ratio + args.test_ratio > 1.0:
+        raise ValueError("--dev-ratio + --test-ratio must be <= 1.0.")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(args.dev_output) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(args.dev_output_jsonl) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.test_output) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.test_output_jsonl) or ".", exist_ok=True)
 
@@ -95,16 +117,25 @@ def main() -> None:
     rng = random.Random(args.seed)
     indices = list(range(len(selected_rows)))
     rng.shuffle(indices)
+    dev_size = int(len(selected_rows) * args.dev_ratio)
     test_size = int(len(selected_rows) * args.test_ratio)
-    test_idx = set(indices[:test_size])
+    dev_idx = set(indices[:dev_size])
+    test_idx = set(indices[dev_size:dev_size + test_size])
 
-    train_rows = [selected_rows[i] for i in range(len(selected_rows)) if i not in test_idx]
+    train_rows = [selected_rows[i] for i in range(len(selected_rows)) if i not in dev_idx and i not in test_idx]
+    dev_rows = [selected_rows[i] for i in range(len(selected_rows)) if i in dev_idx]
     test_rows = [selected_rows[i] for i in range(len(selected_rows)) if i in test_idx]
 
     with open(args.output, "w", encoding="utf-8") as f_out:
         for _, original, minimal_pair, _ in train_rows:
             f_out.write(f"{original}\n")
             f_out.write(f"{minimal_pair}\n")
+
+    with open(args.dev_output, "w", encoding="utf-8") as f_dev, open(args.dev_output_jsonl, "w", encoding="utf-8") as f_dev_jsonl:
+        for raw, original, minimal_pair, _ in dev_rows:
+            f_dev.write(f"{original}\n")
+            f_dev.write(f"{minimal_pair}\n")
+            f_dev_jsonl.write(raw + "\n")
 
     with open(args.test_output, "w", encoding="utf-8") as f_test, open(args.test_output_jsonl, "w", encoding="utf-8") as f_test_jsonl:
         for raw, original, minimal_pair, _ in test_rows:
@@ -116,6 +147,7 @@ def main() -> None:
         "Done.\n"
         f"Input rows: {len(selected_rows)} (filtered by target/pair rules)\n"
         f"Train rows: {len(train_rows)} -> {args.output}\n"
+        f"Dev rows: {len(dev_rows)} -> {args.dev_output}\n"
         f"Test rows: {len(test_rows)} -> {args.test_output}"
     )
 

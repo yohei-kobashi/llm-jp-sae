@@ -15,7 +15,9 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
+from sklearn.linear_model import ElasticNetCV
 
 from analyzer_lingualens import TrainSaeLinguisticAnalyzer
 from LinguaLens.lingualens.utils import (
@@ -54,6 +56,41 @@ class TrainSaeCrossLayerAnalyzer:
         )
         self.model_path = model_path
         self.sae_path_template = sae_path_template
+
+    def analyze_feature_layer(
+        self,
+        feature_file: str,
+        layer_idx: int,
+        top_k: int = 10,
+        layer_position: Optional[int] = None,
+        total_layers: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        layer_result = self.analyzer.analyze_feature_layer(
+            feature_file=feature_file,
+            layer_idx=layer_idx,
+            top_k=top_k,
+            layer_position=layer_position,
+            total_layers=total_layers,
+            retain_sentence_activations=True,
+        )
+
+        sentence_feature_rows = layer_result.pop("sentence_feature_rows", [])
+        layer_results = layer_result.get("layer_results", {})
+        single_layer = layer_results.get(layer_idx, layer_results.get(str(layer_idx), {}))
+        top_features = single_layer.get("top_features", [])
+        full_stats = single_layer.get("full_stats", {})
+
+        if top_features and sentence_feature_rows:
+            elasticnet_result = self._fit_intervention_feature_selector(
+                sentence_feature_rows=sentence_feature_rows,
+                top_features=top_features,
+                full_stats=full_stats,
+            )
+            single_layer["intervention_features"] = elasticnet_result["selected_base_vectors"]
+            single_layer["intervention_feature_weights"] = elasticnet_result["feature_weights"]
+            single_layer["elasticnet"] = elasticnet_result["metadata"]
+
+        return layer_result
 
     def analyze_feature_evolution(
         self,
@@ -285,6 +322,107 @@ class TrainSaeCrossLayerAnalyzer:
     def clear_cache(self):
         self.analyzer.clear_cache()
 
+    def _fit_intervention_feature_selector(
+        self,
+        sentence_feature_rows: List[Dict[str, Any]],
+        top_features: List[List[Any]] | List[tuple[Any, Any]],
+        full_stats: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidate_base_vectors = [int(base_vec) for base_vec, _ in top_features]
+        labels = np.asarray(
+            [float(row.get("label", 0)) for row in sentence_feature_rows],
+            dtype=np.float32,
+        )
+        feature_matrix = np.zeros(
+            (len(sentence_feature_rows), len(candidate_base_vectors)),
+            dtype=np.float32,
+        )
+
+        for row_idx, row in enumerate(sentence_feature_rows):
+            latent_activations = row.get("latent_activations", {})
+            for col_idx, base_vec in enumerate(candidate_base_vectors):
+                feature_matrix[row_idx, col_idx] = float(
+                    latent_activations.get(base_vec, latent_activations.get(str(base_vec), 0.0))
+                )
+
+        coefficients = np.zeros(len(candidate_base_vectors), dtype=np.float32)
+        metadata: Dict[str, Any] = {
+            "status": "not_run",
+            "candidate_base_vectors": candidate_base_vectors,
+            "num_examples": int(len(sentence_feature_rows)),
+            "label_mapping": {
+                "1": "odd_lines_original_text",
+                "0": "even_lines_minimal_pair",
+            },
+        }
+
+        can_fit = (
+            len(candidate_base_vectors) > 0
+            and len(sentence_feature_rows) >= 2
+            and len(np.unique(labels)) >= 2
+        )
+        if can_fit:
+            cv_folds = max(2, min(5, len(sentence_feature_rows)))
+            model = ElasticNetCV(
+                l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 0.99],
+                cv=cv_folds,
+                random_state=42,
+                max_iter=10000,
+            )
+            model.fit(feature_matrix, labels)
+            coefficients = model.coef_.astype(np.float32, copy=False)
+            metadata.update(
+                {
+                    "status": "fit",
+                    "alpha": float(model.alpha_),
+                    "l1_ratio": float(model.l1_ratio_),
+                    "intercept": float(model.intercept_),
+                    "non_zero_feature_count": int(np.count_nonzero(np.abs(coefficients) > 1e-8)),
+                    "score_r2": float(model.score(feature_matrix, labels)),
+                }
+            )
+        else:
+            metadata["status"] = "fallback"
+            if len(candidate_base_vectors) == 0:
+                metadata["reason"] = "no_candidate_base_vectors"
+            elif len(sentence_feature_rows) < 2:
+                metadata["reason"] = "not_enough_examples"
+            else:
+                metadata["reason"] = "single_label_only"
+
+        ranked_indices = np.argsort(-np.abs(coefficients))
+        selected_base_vectors = [
+            candidate_base_vectors[idx]
+            for idx in ranked_indices
+            if abs(float(coefficients[idx])) > 1e-8
+        ]
+        if not selected_base_vectors and candidate_base_vectors:
+            selected_base_vectors = [candidate_base_vectors[0]]
+
+        feature_weights = []
+        for rank_idx in ranked_indices:
+            if rank_idx >= len(candidate_base_vectors):
+                continue
+            base_vec = candidate_base_vectors[rank_idx]
+            stats = full_stats.get(base_vec, full_stats.get(str(base_vec), {}))
+            feature_weights.append(
+                {
+                    "base_vector": int(base_vec),
+                    "weight": float(coefficients[rank_idx]),
+                    "abs_weight": float(abs(coefficients[rank_idx])),
+                    "selected_for_intervention": int(base_vec) in selected_base_vectors,
+                    "frc": float(stats.get("frc", 0.0)),
+                    "ps": float(stats.get("ps", 0.0)),
+                    "pn": float(stats.get("pn", 0.0)),
+                }
+            )
+
+        return {
+            "selected_base_vectors": selected_base_vectors,
+            "feature_weights": feature_weights,
+            "metadata": metadata,
+        }
+
 
 # Backward-compatible alias if users want the same class name as LinguaLens.
 CrossLayerAnalyzer = TrainSaeCrossLayerAnalyzer
@@ -475,7 +613,7 @@ def main() -> None:
                     completed_layers += 1
                     continue
 
-                layer_result = analyzer.analyzer.analyze_feature_layer(
+                layer_result = analyzer.analyze_feature_layer(
                     feature_file=args.feature_file,
                     layer_idx=layer,
                     top_k=args.top_k,

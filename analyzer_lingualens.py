@@ -128,6 +128,7 @@ class BaseTrainSaeLinguisticAnalyzer:
         top_k: int = 10,
         layer_position: Optional[int] = None,
         total_layers: Optional[int] = None,
+        retain_sentence_activations: bool = False,
     ) -> Dict[str, Any]:
         lines = load_text_data(feature_file)
         feature_name = os.path.splitext(os.path.basename(feature_file))[0]
@@ -139,7 +140,17 @@ class BaseTrainSaeLinguisticAnalyzer:
         print(f"{layer_label} start: layer={layer_idx}, top_k={top_k}")
         layer_start = time.perf_counter()
 
-        layer_stats = self._analyze_single_layer(lines, layer_idx)
+        analysis_output = self._analyze_single_layer(
+            lines,
+            layer_idx,
+            retain_sentence_activations=retain_sentence_activations,
+        )
+        if retain_sentence_activations:
+            layer_stats = analysis_output["layer_stats"]
+            sentence_feature_rows = analysis_output["sentence_feature_rows"]
+        else:
+            layer_stats = analysis_output
+            sentence_feature_rows = []
         layer_result: Dict[str, Any] = {
             "feature_file": feature_file,
             "total_examples": len(lines),
@@ -148,6 +159,8 @@ class BaseTrainSaeLinguisticAnalyzer:
             "layer_results": {},
             "unified_results": [],
         }
+        if retain_sentence_activations:
+            layer_result["sentence_feature_rows"] = sentence_feature_rows
 
         if layer_stats:
             top_features = get_top_features_by_frc(layer_stats, top_k)
@@ -359,14 +372,18 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
         return runtime
 
     def _analyze_single_layer(
-        self, lines: List[str], layer_idx: int
-    ) -> Dict[int, Dict[str, float]]:
+        self,
+        lines: List[str],
+        layer_idx: int,
+        retain_sentence_activations: bool = False,
+    ) -> Dict[str, Any] | Dict[int, Dict[str, float]]:
         runtime = self._get_sae_model(layer_idx)
         model = self._load_base_model()
         sae: SparseAutoEncoder = runtime["sae"]
         hook: SimpleHook = runtime["hook"]
 
         structured_data: List[Dict[str, Any]] = []
+        sentence_feature_rows: List[Dict[str, Any]] = []
         total_batches = max(1, (len(lines) + self.batch_size - 1) // self.batch_size)
         log_interval = max(1, total_batches // 10)
 
@@ -411,6 +428,7 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
                 tokens = [tok.replace("▁", " ") for tok in tokens]
 
                 sentence_tokens: List[Dict[str, Any]] = []
+                sentence_latent_activations: Dict[int, float] = {}
                 if valid_len > 0:
                     activation = acts[i, :valid_len, :]
                     activation = normalize_activation(activation, self.normalization)
@@ -426,6 +444,11 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
                         token_activations = []
                         for base_vector, value in zip(idxs, vals):
                             if value > 0:
+                                current_value = sentence_latent_activations.get(
+                                    int(base_vector), 0.0
+                                )
+                                if value > current_value:
+                                    sentence_latent_activations[int(base_vector)] = float(value)
                                 token_activations.append(
                                     {
                                         "base_vector": int(base_vector),
@@ -442,10 +465,26 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
                         "tokens": sentence_tokens,
                     }
                 )
+                if retain_sentence_activations:
+                    sentence_id = start + i + 1
+                    sentence_feature_rows.append(
+                        {
+                            "sentence_id": sentence_id,
+                            "label": 1 if sentence_id % 2 == 1 else 0,
+                            "line_type": "original" if sentence_id % 2 == 1 else "minimal_pair",
+                            "latent_activations": sentence_latent_activations,
+                        }
+                    )
 
             hook.output = None
 
-        return compute_layer_stats(structured_data)
+        layer_stats = compute_layer_stats(structured_data)
+        if retain_sentence_activations:
+            return {
+                "layer_stats": layer_stats,
+                "sentence_feature_rows": sentence_feature_rows,
+            }
+        return layer_stats
 
     def clear_cache(self):
         for runtime in self._model_cache.values():

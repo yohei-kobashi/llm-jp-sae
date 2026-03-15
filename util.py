@@ -57,6 +57,11 @@ class InterventionConfig(PretrainedConfig):
                 "intervention indices are not provided when set intervention to True"
             )
         self.intervention_value = kwargs.pop("intervention_value", 0.0)
+        self.intervention_weights = kwargs.pop("intervention_weights", None)
+        if self.intervention_weights is not None and self.intervention_indices is not None:
+            assert len(self.intervention_weights) == len(self.intervention_indices), (
+                "intervention_weights must have the same length as intervention_indices."
+            )
         self.prompt_only = kwargs.pop("prompt_only", False)
 
 
@@ -250,24 +255,26 @@ class TransformerWithSae(torch.nn.Module):
             self._apply_intervention_add_or_set()
 
     def _apply_intervention_multiply(self):
-        for intervention_index in self.intervention_config.intervention_indices:
+        for position, intervention_index in enumerate(self.intervention_config.intervention_indices):
+            intervention_value = self._get_intervention_value(position)
             mask = self.encoder_output.sparse_feature_indices == intervention_index
             self.encoder_output.sparse_feature_activations[mask] *= (
-                self.intervention_config.intervention_value
+                intervention_value
             )
 
     def _apply_intervention_add_or_set(self):
-        for intervention_index in self.intervention_config.intervention_indices:
+        for position, intervention_index in enumerate(self.intervention_config.intervention_indices):
+            intervention_value = self._get_intervention_value(position)
             mask = self.encoder_output.sparse_feature_indices == intervention_index
             is_ind_activated = torch.any(mask, dim=-1)
 
             if self.intervention_config.intervention_mode == "add":
                 self.encoder_output.sparse_feature_activations[mask] += (
-                    self.intervention_config.intervention_value
+                    intervention_value
                 )
             elif self.intervention_config.intervention_mode == "set":
                 self.encoder_output.sparse_feature_activations[mask] = (
-                    self.intervention_config.intervention_value
+                    intervention_value
                 )
 
             if not torch.all(is_ind_activated):
@@ -282,13 +289,18 @@ class TransformerWithSae(torch.nn.Module):
                 )
 
                 set_val = min_val.clone()
-                set_val[~is_ind_activated] = self.intervention_config.intervention_value
+                set_val[~is_ind_activated] = intervention_value
 
                 set_ind = self.encoder_output.sparse_feature_indices[token_select, min_ind]
                 set_ind[~is_ind_activated] = intervention_index
 
                 self.encoder_output.sparse_feature_activations[token_select, min_ind] = set_val
                 self.encoder_output.sparse_feature_indices[token_select, min_ind] = set_ind
+
+    def _get_intervention_value(self, position: int) -> float:
+        if self.intervention_config.intervention_weights is not None:
+            return float(self.intervention_config.intervention_weights[position])
+        return float(self.intervention_config.intervention_value)
 
     def update_intervention_config(self, intervention_config: InterventionConfig):
         self.intervention_config = intervention_config

@@ -1,17 +1,7 @@
 #!/bin/bash -l
 
-#------ qsub option --------#
-#PBS -q regular-g
-#PBS -l select=1
-#PBS -l walltime=6:00:00
-#PBS -W group_list=gj26
-#PBS -j oe
-
 #------- Program execution -------#
 set -euo pipefail
-
-source ~/start_gpu_nodes.sh
-cd llm-jp-sae 
 
 usage() {
   cat <<'EOF'

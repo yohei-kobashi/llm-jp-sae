@@ -10,11 +10,8 @@
 #------- Program execution -------#
 set -euo pipefail
 
-module purge
-module load python/3.10.16 cuda
-
+source ~/start_gpu_nodes.sh
 cd llm-jp-sae 
-source env_g/bin/activate
 
 usage() {
   cat <<'EOF'

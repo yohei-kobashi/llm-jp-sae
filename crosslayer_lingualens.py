@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from sklearn.linear_model import ElasticNetCV
+from sklearn.linear_model import LassoCV
 
 from analyzer_lingualens import TrainSaeLinguisticAnalyzer
 from LinguaLens.lingualens.utils import (
@@ -81,14 +81,14 @@ class TrainSaeCrossLayerAnalyzer:
         full_stats = single_layer.get("full_stats", {})
 
         if top_features and sentence_feature_rows:
-            elasticnet_result = self._fit_intervention_feature_selector(
+            stability_result = self._fit_intervention_feature_selector(
                 sentence_feature_rows=sentence_feature_rows,
                 top_features=top_features,
                 full_stats=full_stats,
             )
-            single_layer["intervention_features"] = elasticnet_result["selected_base_vectors"]
-            single_layer["intervention_feature_weights"] = elasticnet_result["feature_weights"]
-            single_layer["elasticnet"] = elasticnet_result["metadata"]
+            single_layer["intervention_features"] = stability_result["selected_base_vectors"]
+            single_layer["intervention_feature_weights"] = stability_result["feature_weights"]
+            single_layer["stability_selection"] = stability_result["metadata"]
 
         return layer_result
 
@@ -346,8 +346,10 @@ class TrainSaeCrossLayerAnalyzer:
                 )
 
         coefficients = np.zeros(len(candidate_base_vectors), dtype=np.float32)
+        stability_scores = np.zeros(len(candidate_base_vectors), dtype=np.float32)
         metadata: Dict[str, Any] = {
             "status": "not_run",
+            "method": "lasso_stability_selection",
             "candidate_base_vectors": candidate_base_vectors,
             "num_examples": int(len(sentence_feature_rows)),
             "label_mapping": {
@@ -362,25 +364,80 @@ class TrainSaeCrossLayerAnalyzer:
             and len(np.unique(labels)) >= 2
         )
         if can_fit:
-            cv_folds = max(2, min(5, len(sentence_feature_rows)))
-            model = ElasticNetCV(
-                l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 0.99],
-                cv=cv_folds,
-                random_state=42,
-                max_iter=10000,
-            )
-            model.fit(feature_matrix, labels)
-            coefficients = model.coef_.astype(np.float32, copy=False)
-            metadata.update(
-                {
-                    "status": "fit",
-                    "alpha": float(model.alpha_),
-                    "l1_ratio": float(model.l1_ratio_),
-                    "intercept": float(model.intercept_),
-                    "non_zero_feature_count": int(np.count_nonzero(np.abs(coefficients) > 1e-8)),
-                    "score_r2": float(model.score(feature_matrix, labels)),
-                }
-            )
+            num_examples = len(sentence_feature_rows)
+            subsample_fraction = 0.75
+            subsample_size = max(2, int(np.ceil(num_examples * subsample_fraction)))
+            num_bootstraps = 100
+            selection_threshold = 0.6
+            rng = np.random.default_rng(42)
+            successful_fits = 0
+            non_zero_counts = np.zeros(len(candidate_base_vectors), dtype=np.int32)
+
+            def _standardize_matrix(matrix: np.ndarray) -> np.ndarray:
+                feature_means = matrix.mean(axis=0, dtype=np.float64)
+                feature_stds = matrix.std(axis=0, dtype=np.float64)
+                feature_stds[feature_stds < 1e-6] = 1.0
+                standardized = (matrix - feature_means) / feature_stds
+                return standardized.astype(np.float32, copy=False)
+
+            for bootstrap_idx in range(num_bootstraps):
+                sample_indices = rng.choice(
+                    num_examples,
+                    size=subsample_size,
+                    replace=False,
+                )
+                sample_labels = labels[sample_indices]
+                if len(np.unique(sample_labels)) < 2:
+                    continue
+                sample_matrix = _standardize_matrix(feature_matrix[sample_indices])
+                cv_folds = max(2, min(5, len(sample_indices)))
+                model = LassoCV(
+                    cv=cv_folds,
+                    random_state=42 + bootstrap_idx,
+                    max_iter=10000,
+                )
+                model.fit(sample_matrix, sample_labels)
+                sample_coefficients = model.coef_.astype(np.float32, copy=False)
+                non_zero_counts += (np.abs(sample_coefficients) > 1e-8).astype(np.int32)
+                successful_fits += 1
+
+            if successful_fits > 0:
+                stability_scores = non_zero_counts.astype(np.float32) / float(successful_fits)
+                standardized_feature_matrix = _standardize_matrix(feature_matrix)
+                final_cv_folds = max(2, min(5, len(sentence_feature_rows)))
+                final_model = LassoCV(
+                    cv=final_cv_folds,
+                    random_state=42,
+                    max_iter=10000,
+                )
+                final_model.fit(standardized_feature_matrix, labels)
+                coefficients = final_model.coef_.astype(np.float32, copy=False)
+                metadata.update(
+                    {
+                        "status": "fit",
+                        "alpha": float(final_model.alpha_),
+                        "intercept": float(final_model.intercept_),
+                        "non_zero_feature_count": int(
+                            np.count_nonzero(np.abs(coefficients) > 1e-8)
+                        ),
+                        "score_r2": float(final_model.score(standardized_feature_matrix, labels)),
+                        "num_bootstraps": int(num_bootstraps),
+                        "successful_bootstraps": int(successful_fits),
+                        "subsample_fraction": float(subsample_fraction),
+                        "selection_threshold": float(selection_threshold),
+                    }
+                )
+            else:
+                metadata.update(
+                    {
+                        "status": "fallback",
+                        "reason": "bootstrap_subsamples_single_label_only",
+                        "num_bootstraps": int(num_bootstraps),
+                        "successful_bootstraps": int(successful_fits),
+                        "subsample_fraction": float(subsample_fraction),
+                        "selection_threshold": float(selection_threshold),
+                    }
+                )
         else:
             metadata["status"] = "fallback"
             if len(candidate_base_vectors) == 0:
@@ -390,14 +447,24 @@ class TrainSaeCrossLayerAnalyzer:
             else:
                 metadata["reason"] = "single_label_only"
 
-        ranked_indices = np.argsort(-np.abs(coefficients))
+        ranked_indices = sorted(
+            range(len(candidate_base_vectors)),
+            key=lambda idx: (
+                float(stability_scores[idx]),
+                float(abs(coefficients[idx])),
+            ),
+            reverse=True,
+        )
         selected_base_vectors = [
             candidate_base_vectors[idx]
             for idx in ranked_indices
-            if abs(float(coefficients[idx])) > 1e-8
+            if float(stability_scores[idx]) >= float(metadata.get("selection_threshold", 0.6))
         ]
         if not selected_base_vectors and candidate_base_vectors:
-            selected_base_vectors = [candidate_base_vectors[0]]
+            if ranked_indices:
+                selected_base_vectors = [candidate_base_vectors[ranked_indices[0]]]
+            else:
+                selected_base_vectors = [candidate_base_vectors[0]]
 
         feature_weights = []
         for rank_idx in ranked_indices:
@@ -410,6 +477,7 @@ class TrainSaeCrossLayerAnalyzer:
                     "base_vector": int(base_vec),
                     "weight": float(coefficients[rank_idx]),
                     "abs_weight": float(abs(coefficients[rank_idx])),
+                    "stability_score": float(stability_scores[rank_idx]),
                     "selected_for_intervention": int(base_vec) in selected_base_vectors,
                     "frc": float(stats.get("frc", 0.0)),
                     "ps": float(stats.get("ps", 0.0)),

@@ -57,7 +57,7 @@ SEED="42"
 TOP_K="10"
 K="32"
 NORMALIZATION="Scalar"
-BATCH_SIZE="32"
+BATCH_SIZE="64"
 TORCH_DTYPE="bfloat16"
 DEVICE=""
 RANDOM_SEED=""
@@ -218,6 +218,11 @@ run_for_target() {
     exit 1
   fi
 
+  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "OPENAI_API_KEY is required for alpha tuning and LLM-as-a-Judge evaluation in step 4." >&2
+    exit 1
+  fi
+
   echo "[4/4] Running layer-wise interventions with test prompts"
   python intervener_lingualens.py \
     --model-path "$MODEL_PATH" \
@@ -227,6 +232,9 @@ run_for_target() {
     --selection-mode per-layer \
     --resume \
     --prompt-file "$test_txt" \
+    --dev-prompt-file "$dev_txt" \
+    --test-prompt-file "$test_txt" \
+    --target-modality "$target" \
     --k "$K" \
     --normalization "$NORMALIZATION" \
     --torch-dtype "$TORCH_DTYPE" \

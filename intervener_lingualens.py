@@ -881,10 +881,48 @@ def _slugify_alpha(alpha: float) -> str:
     return str(alpha).replace("-", "neg_").replace(".", "p")
 
 
+def _candidate_slug(candidate: Dict[str, Any]) -> str:
+    base_vectors = "-".join(map(str, candidate.get("base_vectors", []))) or "none"
+    return f"layer{candidate['layer_idx']}_bv{base_vectors}"
+
+
+def _requires_alpha_tuning(candidate: Dict[str, Any]) -> bool:
+    return bool(candidate.get("feature_weights"))
+
+
+def _validate_alpha_tuning_args(args: argparse.Namespace) -> None:
+    if not args.output_dir:
+        raise ValueError("--output-dir is required for automatic alpha tuning.")
+    if not args.dev_prompt_file or not args.test_prompt_file:
+        raise ValueError(
+            "--dev-prompt-file and --test-prompt-file are required for automatic alpha tuning."
+        )
+    if not args.target_modality:
+        raise ValueError("--target-modality is required for automatic alpha tuning.")
+
+
+def _run_saved_results_judge(
+    output_path: str,
+    target_modality: str,
+    max_workers: int,
+) -> Dict[str, Any]:
+    experiment_results = _load_results_json(output_path)
+    judge_results = _evaluate_intervention_results_with_judge(
+        experiment_results=experiment_results,
+        target_modality=target_modality,
+        max_workers=max_workers,
+    )
+    judge_path = _save_json(_judge_output_path(output_path), judge_results)
+    return {
+        "judge_path": judge_path,
+        "judge_summary": judge_results["summary"],
+    }
+
+
 def _evaluate_intervention_results_with_judge(
     experiment_results: Dict[str, Any],
     target_modality: str,
-    max_workers: int = 8,
+    max_workers: int = 32,
 ) -> Dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
         raise EnvironmentError("OPENAI_API_KEY is not set.")
@@ -1006,22 +1044,17 @@ def _evaluate_intervention_results_with_judge(
 def _run_alpha_sweep_and_test(
     args: argparse.Namespace,
     candidate: Dict[str, Any],
+    output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if not args.output_dir:
-        raise ValueError("--output-dir is required for alpha tuning mode.")
-    if not args.dev_prompt_file or not args.test_prompt_file:
-        raise ValueError(
-            "--dev-prompt-file and --test-prompt-file are required for alpha tuning mode."
-        )
-    if not args.target_modality:
-        raise ValueError("--target-modality is required for alpha tuning mode.")
+    _validate_alpha_tuning_args(args)
     if not candidate.get("feature_weights"):
         raise ValueError(
-            "Selected intervention candidate does not contain ElasticNet weights. "
+            "Selected intervention candidate does not contain feature-selection weights. "
             "Regenerate crosslayer outputs before running alpha tuning."
         )
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    candidate_output_dir = output_dir or os.path.join(args.output_dir, _candidate_slug(candidate))
+    os.makedirs(candidate_output_dir, exist_ok=True)
     with open(args.dev_prompt_file, "r", encoding="utf-8") as f:
         dev_prompt_text = f.read()
     with open(args.test_prompt_file, "r", encoding="utf-8") as f:
@@ -1032,7 +1065,7 @@ def _run_alpha_sweep_and_test(
 
     for alpha in args.alpha_values:
         alpha_slug = _slugify_alpha(alpha)
-        output_path = os.path.join(args.output_dir, f"dev_alpha_{alpha_slug}.txt")
+        output_path = os.path.join(candidate_output_dir, f"dev_alpha_{alpha_slug}.txt")
         print(f"Running dev alpha sweep: alpha={alpha}")
         selection_meta = _run_single_candidate(
             args=args,
@@ -1070,16 +1103,22 @@ def _run_alpha_sweep_and_test(
 
     assert best_alpha_result is not None
     best_alpha = float(best_alpha_result["alpha"])
-    summary_path = os.path.join(args.output_dir, "alpha_sweep_summary.json")
+    summary_path = os.path.join(candidate_output_dir, "alpha_sweep_summary.json")
     alpha_summary = {
         "target_modality": args.target_modality,
+        "candidate": {
+            "cross_json": candidate.get("cross_json", args.crosslayer_json),
+            "layer_idx": candidate["layer_idx"],
+            "base_vectors": candidate["base_vectors"],
+            "feature_weights": candidate.get("feature_weights", []),
+        },
         "selected_alpha": best_alpha,
         "alpha_results": alpha_results,
     }
     _save_json(summary_path, alpha_summary)
 
     test_output_path = os.path.join(
-        args.output_dir, f"test_selected_alpha_{_slugify_alpha(best_alpha)}.txt"
+        candidate_output_dir, f"test_selected_alpha_{_slugify_alpha(best_alpha)}.txt"
     )
     print(f"Running test evaluation with selected alpha={best_alpha}")
     test_selection = _run_single_candidate(
@@ -1100,14 +1139,24 @@ def _run_alpha_sweep_and_test(
 
     final_summary = {
         "target_modality": args.target_modality,
+        "candidate": {
+            "cross_json": candidate.get("cross_json", args.crosslayer_json),
+            "layer_idx": candidate["layer_idx"],
+            "base_vectors": candidate["base_vectors"],
+            "feature_weights": candidate.get("feature_weights", []),
+        },
         "selected_alpha": best_alpha,
+        "output_dir": candidate_output_dir,
         "dev_summary_path": summary_path,
         "test_output_path": test_output_path,
         "test_selection": test_selection,
         "test_judge_path": test_judge_path,
         "test_summary": test_judge["summary"],
     }
-    _save_json(os.path.join(args.output_dir, "test_evaluation_summary.json"), final_summary)
+    _save_json(
+        os.path.join(candidate_output_dir, "test_evaluation_summary.json"),
+        final_summary,
+    )
     return final_summary
 
 
@@ -1321,48 +1370,40 @@ def main() -> int:
     parser.add_argument(
         "--judge-max-workers",
         type=int,
-        default=int(os.getenv("MAX_WORKERS", "8")),
+        default=int(os.getenv("MAX_WORKERS", "32")),
         help="Max parallel judge requests for gpt-5-mini evaluation.",
-    )
-    parser.add_argument(
-        "--tune-alpha",
-        action="store_true",
-        help="Tune alpha on dev prompts with gpt-5-mini and evaluate the selected alpha on test prompts.",
     )
 
     args = parser.parse_args()
-    if args.selection_mode == "best" and not args.output_path:
-        if not args.tune_alpha:
-            raise ValueError("--output-path is required when --selection-mode=best.")
     if args.selection_mode == "per-layer" and not args.output_dir:
         raise ValueError("--output-dir is required when --selection-mode=per-layer.")
     args.alpha_values = [
         float(value.strip()) for value in args.alpha_values.split(",") if value.strip()
     ]
-    if args.tune_alpha and not args.output_dir:
-        raise ValueError("--output-dir is required when --tune-alpha is set.")
-    if not args.tune_alpha and not args.prompt and not args.prompt_file:
-        raise ValueError("Specify --prompt or --prompt-file.")
-    if args.tune_alpha and (not args.dev_prompt_file or not args.test_prompt_file):
-        raise ValueError(
-            "--dev-prompt-file and --test-prompt-file are required when --tune-alpha is set."
-        )
 
     crosslayer_entries = _load_crosslayer_jsons(args.crosslayer_json)
 
-    prompt_text = args.prompt
-    if args.prompt_file:
-        with open(args.prompt_file, "r", encoding="utf-8") as f:
-            prompt_text = f.read()
-
     if args.selection_mode == "best":
         best = _select_best_intervention_candidate_from_many(crosslayer_entries)
-        if args.tune_alpha:
+        if _requires_alpha_tuning(best):
+            if not args.output_dir:
+                raise ValueError(
+                    "--output-dir is required when the selected candidate has feature weights."
+                )
             _run_alpha_sweep_and_test(
                 args=args,
                 candidate=best,
+                output_dir=os.path.join(args.output_dir, _candidate_slug(best)),
             )
             return 0
+        if not args.output_path:
+            raise ValueError("--output-path is required when --selection-mode=best.")
+        if not args.prompt and not args.prompt_file:
+            raise ValueError("Specify --prompt or --prompt-file.")
+        prompt_text = args.prompt
+        if args.prompt_file:
+            with open(args.prompt_file, "r", encoding="utf-8") as f:
+                prompt_text = f.read()
         _run_single_candidate(
             args=args,
             candidate=best,
@@ -1374,21 +1415,63 @@ def main() -> int:
 
     os.makedirs(args.output_dir, exist_ok=True)
     candidates = _select_per_layer_intervention_candidates_from_many(crosslayer_entries)
+    requires_prompt = any(not _requires_alpha_tuning(candidate) for candidate in candidates)
+    prompt_text = args.prompt
+    if requires_prompt:
+        if not args.prompt and not args.prompt_file:
+            raise ValueError("Specify --prompt or --prompt-file.")
+        if args.prompt_file:
+            with open(args.prompt_file, "r", encoding="utf-8") as f:
+                prompt_text = f.read()
 
     for candidate in candidates:
+        if _requires_alpha_tuning(candidate):
+            _run_alpha_sweep_and_test(
+                args=args,
+                candidate=candidate,
+                output_dir=os.path.join(args.output_dir, _candidate_slug(candidate)),
+            )
+            continue
+
         output_path = os.path.join(
             args.output_dir, f"layer{candidate['layer_idx']}_intervention.txt"
         )
         experiment_name = args.experiment_name or (
             f"intervention_layer{candidate['layer_idx']}_bv{'-'.join(map(str, candidate['base_vectors']))}"
         )
-        _run_single_candidate(
+        selection_meta = _run_single_candidate(
             args=args,
             candidate=candidate,
             prompt_text=prompt_text,
             output_path=output_path,
             experiment_name=experiment_name,
         )
+        if args.target_modality:
+            judge_meta = _run_saved_results_judge(
+                output_path=output_path,
+                target_modality=args.target_modality,
+                max_workers=args.judge_max_workers,
+            )
+            per_layer_summary = {
+                "target_modality": args.target_modality,
+                "candidate": {
+                    "cross_json": candidate.get("cross_json", args.crosslayer_json),
+                    "layer_idx": candidate["layer_idx"],
+                    "base_vectors": candidate["base_vectors"],
+                    "feature_weights": candidate.get("feature_weights", []),
+                },
+                "output_path": output_path,
+                "selection_meta": selection_meta,
+                "test_judge_path": judge_meta["judge_path"],
+                "test_summary": judge_meta["judge_summary"],
+            }
+            _save_json(
+                os.path.join(
+                    args.output_dir,
+                    f"{_candidate_slug(candidate)}_test_evaluation_summary.json",
+                ),
+                per_layer_summary,
+            )
     return 0
 
 

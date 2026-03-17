@@ -378,7 +378,7 @@ class TrainSaeCrossLayerAnalyzer:
                 feature_stds = matrix.std(axis=0, dtype=np.float64)
                 feature_stds[feature_stds < 1e-6] = 1.0
                 standardized = (matrix - feature_means) / feature_stds
-                return standardized.astype(np.float32, copy=False)
+                return standardized.astype(np.float64, copy=False)
 
             for bootstrap_idx in range(num_bootstraps):
                 sample_indices = rng.choice(
@@ -395,6 +395,7 @@ class TrainSaeCrossLayerAnalyzer:
                     cv=cv_folds,
                     random_state=42 + bootstrap_idx,
                     max_iter=10000,
+                    precompute=False,
                 )
                 model.fit(sample_matrix, sample_labels)
                 sample_coefficients = model.coef_.astype(np.float32, copy=False)
@@ -409,6 +410,7 @@ class TrainSaeCrossLayerAnalyzer:
                     cv=final_cv_folds,
                     random_state=42,
                     max_iter=10000,
+                    precompute=False,
                 )
                 final_model.fit(standardized_feature_matrix, labels)
                 coefficients = final_model.coef_.astype(np.float32, copy=False)

@@ -37,7 +37,7 @@ Optional arguments:
 EOF
 }
 
-# ["will", "can", "could", "may", "might", "must", "shall", "should", "would", "ought to", "suppose"]
+# ["will", "can", "could", "may", "might", "must", "should", "would", "suppose"]
 TARGETS=("will")
 # llm-jp/llm-jp-3-1.8b, allenai/OLMo-2-0425-1B, meta-llama/Llama-3.2-1B, Qwen/Qwen2.5-1.5B
 MODEL_PATH="llm-jp/llm-jp-3-1.8b"
@@ -122,6 +122,35 @@ resolve_layers() {
   ALL_LAYERS="$(IFS=,; echo "${SORTED_LAYERS[*]}")"
 }
 
+is_target_completed() {
+  local target_slug="$1"
+  local data_dir="$2"
+  local crosslayer_dir="$3"
+  local train_txt dev_txt dev_jsonl test_txt test_jsonl
+  local feature_name layer output_path
+
+  train_txt="$data_dir/${target_slug}_train.txt"
+  dev_txt="$data_dir/${target_slug}_dev.txt"
+  dev_jsonl="$data_dir/${target_slug}_dev.jsonl"
+  test_txt="$data_dir/${target_slug}_test.txt"
+  test_jsonl="$data_dir/${target_slug}_test.jsonl"
+
+  if [[ ! -f "$train_txt" || ! -f "$dev_txt" || ! -f "$dev_jsonl" || ! -f "$test_txt" || ! -f "$test_jsonl" ]]; then
+    return 1
+  fi
+
+  feature_name="${target_slug}_train"
+  IFS=',' read -r -a layers <<< "$ALL_LAYERS"
+  for layer in "${layers[@]}"; do
+    output_path="$crosslayer_dir/${feature_name}_layer${layer}_evolution.json"
+    if [[ ! -f "$output_path" ]]; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
 run_for_target() {
   local target="$1"
   local target_slug target_dir data_dir crosslayer_dir
@@ -142,6 +171,12 @@ run_for_target() {
   echo "============================================================"
   echo "Processing target: $target"
   echo "Output directory: $target_dir"
+
+  if is_target_completed "$target_slug" "$data_dir" "$crosslayer_dir"; then
+    echo "Skipping target: $target"
+    echo "Reason: all expected data files and cross-layer outputs already exist."
+    return 0
+  fi
 
   if (( START_STEP <= 1 )); then
     echo "[1/3] Generating train/dev/test data for target: $target"

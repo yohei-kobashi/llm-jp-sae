@@ -17,14 +17,18 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from sklearn.linear_model import LassoCV
+from sklearn.linear_model import ElasticNetCV, LassoCV
 
 from analyzer_lingualens import TrainSaeLinguisticAnalyzer
+from LinguaLens.lingualens.metrics import get_top_features_by_frc
 from LinguaLens.lingualens.utils import (
     ProgressLogger,
     save_json_results,
     validate_layer_indices,
 )
+
+TOP_FEATURE_SAVE_COUNT = 100
+LASSO_SELECTION_COUNTS = (10, 20, 50, 100)
 
 
 class TrainSaeCrossLayerAnalyzer:
@@ -77,18 +81,39 @@ class TrainSaeCrossLayerAnalyzer:
         sentence_feature_rows = layer_result.pop("sentence_feature_rows", [])
         layer_results = layer_result.get("layer_results", {})
         single_layer = layer_results.get(layer_idx, layer_results.get(str(layer_idx), {}))
-        top_features = single_layer.get("top_features", [])
         full_stats = single_layer.get("full_stats", {})
+        top_100_features = get_top_features_by_frc(full_stats, TOP_FEATURE_SAVE_COUNT)
+        single_layer["top_100_features"] = top_100_features
+        single_layer["top_100_base_vectors_desc"] = [
+            int(base_vec) for base_vec, _ in top_100_features
+        ]
 
-        if top_features and sentence_feature_rows:
+        if top_100_features and sentence_feature_rows:
             stability_result = self._fit_intervention_feature_selector(
                 sentence_feature_rows=sentence_feature_rows,
-                top_features=top_features,
+                top_features=top_100_features,
                 full_stats=full_stats,
             )
-            single_layer["intervention_features"] = stability_result["selected_base_vectors"]
+            default_selection_key = "top_100"
+            single_layer["intervention_features"] = stability_result["selected_base_vectors_by_count"][
+                default_selection_key
+            ]
             single_layer["intervention_feature_weights"] = stability_result["feature_weights"]
             single_layer["stability_selection"] = stability_result["metadata"]
+            single_layer["lasso_selections"] = stability_result["selections_by_count"]
+            single_layer["lasso_selected_base_vectors"] = stability_result[
+                "selected_base_vectors_by_count"
+            ]
+            single_layer["elasticnet_feature_weights"] = stability_result[
+                "elasticnet_feature_weights"
+            ]
+            single_layer["elasticnet_selection"] = stability_result["elasticnet_metadata"]
+            single_layer["elasticnet_selections"] = stability_result[
+                "elasticnet_selections_by_count"
+            ]
+            single_layer["elasticnet_selected_base_vectors"] = stability_result[
+                "elasticnet_selected_base_vectors_by_count"
+            ]
 
         return layer_result
 
@@ -328,6 +353,61 @@ class TrainSaeCrossLayerAnalyzer:
         top_features: List[List[Any]] | List[tuple[Any, Any]],
         full_stats: Dict[str, Any],
     ) -> Dict[str, Any]:
+        def _standardize_matrix(matrix: np.ndarray) -> np.ndarray:
+            feature_means = matrix.mean(axis=0, dtype=np.float64)
+            feature_stds = matrix.std(axis=0, dtype=np.float64)
+            feature_stds[feature_stds < 1e-6] = 1.0
+            standardized = (matrix - feature_means) / feature_stds
+            return standardized.astype(np.float64, copy=False)
+
+        def _build_ranked_feature_weights(
+            ranked_indices: List[int],
+            coefficients: np.ndarray,
+            scores: np.ndarray,
+            score_name: str,
+        ) -> List[Dict[str, Any]]:
+            ranked_feature_weights: List[Dict[str, Any]] = []
+            for rank_idx in ranked_indices:
+                if rank_idx >= len(candidate_base_vectors):
+                    continue
+                base_vec = candidate_base_vectors[rank_idx]
+                stats = full_stats.get(base_vec, full_stats.get(str(base_vec), {}))
+                ranked_feature_weights.append(
+                    {
+                        "base_vector": int(base_vec),
+                        "weight": float(coefficients[rank_idx]),
+                        "abs_weight": float(abs(coefficients[rank_idx])),
+                        score_name: float(scores[rank_idx]),
+                        "frc": float(stats.get("frc", 0.0)),
+                        "ps": float(stats.get("ps", 0.0)),
+                        "pn": float(stats.get("pn", 0.0)),
+                    }
+                )
+            return ranked_feature_weights
+
+        def _build_topn_selections(
+            ranked_indices: List[int],
+            ranked_feature_weights: List[Dict[str, Any]],
+        ) -> tuple[Dict[str, Any], Dict[str, List[int]]]:
+            selections_by_count: Dict[str, Any] = {}
+            selected_base_vectors_by_count: Dict[str, List[int]] = {}
+            available_count = len(ranked_indices)
+            for selection_count in LASSO_SELECTION_COUNTS:
+                selection_key = f"top_{selection_count}"
+                capped_count = min(selection_count, available_count)
+                selected_rank_indices = ranked_indices[:capped_count]
+                selected_base_vectors = [
+                    candidate_base_vectors[idx] for idx in selected_rank_indices
+                ]
+                selected_base_vectors_by_count[selection_key] = selected_base_vectors
+                selections_by_count[selection_key] = {
+                    "selection_count_requested": int(selection_count),
+                    "selection_count_returned": int(capped_count),
+                    "selected_base_vectors": selected_base_vectors,
+                    "feature_weights": ranked_feature_weights[:capped_count],
+                }
+            return selections_by_count, selected_base_vectors_by_count
+
         candidate_base_vectors = [int(base_vec) for base_vec, _ in top_features]
         labels = np.asarray(
             [float(row.get("label", 0)) for row in sentence_feature_rows],
@@ -343,13 +423,24 @@ class TrainSaeCrossLayerAnalyzer:
             for col_idx, base_vec in enumerate(candidate_base_vectors):
                 feature_matrix[row_idx, col_idx] = float(
                     latent_activations.get(base_vec, latent_activations.get(str(base_vec), 0.0))
-                )
+        )
 
         coefficients = np.zeros(len(candidate_base_vectors), dtype=np.float32)
         stability_scores = np.zeros(len(candidate_base_vectors), dtype=np.float32)
+        elasticnet_coefficients = np.zeros(len(candidate_base_vectors), dtype=np.float32)
         metadata: Dict[str, Any] = {
             "status": "not_run",
             "method": "lasso_stability_selection",
+            "candidate_base_vectors": candidate_base_vectors,
+            "num_examples": int(len(sentence_feature_rows)),
+            "label_mapping": {
+                "1": "odd_lines_original_text",
+                "0": "even_lines_minimal_pair",
+            },
+        }
+        elasticnet_metadata: Dict[str, Any] = {
+            "status": "not_run",
+            "method": "elasticnet_cv",
             "candidate_base_vectors": candidate_base_vectors,
             "num_examples": int(len(sentence_feature_rows)),
             "label_mapping": {
@@ -372,13 +463,6 @@ class TrainSaeCrossLayerAnalyzer:
             rng = np.random.default_rng(42)
             successful_fits = 0
             non_zero_counts = np.zeros(len(candidate_base_vectors), dtype=np.int32)
-
-            def _standardize_matrix(matrix: np.ndarray) -> np.ndarray:
-                feature_means = matrix.mean(axis=0, dtype=np.float64)
-                feature_stds = matrix.std(axis=0, dtype=np.float64)
-                feature_stds[feature_stds < 1e-6] = 1.0
-                standardized = (matrix - feature_means) / feature_stds
-                return standardized.astype(np.float64, copy=False)
 
             for bootstrap_idx in range(num_bootstraps):
                 sample_indices = rng.choice(
@@ -429,6 +513,39 @@ class TrainSaeCrossLayerAnalyzer:
                         "selection_threshold": float(selection_threshold),
                     }
                 )
+
+                try:
+                    elasticnet_model = ElasticNetCV(
+                        l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99],
+                        cv=final_cv_folds,
+                        random_state=42,
+                        max_iter=10000,
+                    )
+                    elasticnet_model.fit(standardized_feature_matrix, labels)
+                    elasticnet_coefficients = elasticnet_model.coef_.astype(
+                        np.float32, copy=False
+                    )
+                    elasticnet_metadata.update(
+                        {
+                            "status": "fit",
+                            "alpha": float(elasticnet_model.alpha_),
+                            "l1_ratio": float(elasticnet_model.l1_ratio_),
+                            "intercept": float(elasticnet_model.intercept_),
+                            "non_zero_feature_count": int(
+                                np.count_nonzero(np.abs(elasticnet_coefficients) > 1e-8)
+                            ),
+                            "score_r2": float(
+                                elasticnet_model.score(standardized_feature_matrix, labels)
+                            ),
+                        }
+                    )
+                except Exception as exc:
+                    elasticnet_metadata.update(
+                        {
+                            "status": "fallback",
+                            "reason": f"elasticnet_fit_failed: {exc}",
+                        }
+                    )
             else:
                 metadata.update(
                     {
@@ -440,14 +557,24 @@ class TrainSaeCrossLayerAnalyzer:
                         "selection_threshold": float(selection_threshold),
                     }
                 )
+                elasticnet_metadata.update(
+                    {
+                        "status": "fallback",
+                        "reason": "bootstrap_subsamples_single_label_only",
+                    }
+                )
         else:
             metadata["status"] = "fallback"
+            elasticnet_metadata["status"] = "fallback"
             if len(candidate_base_vectors) == 0:
                 metadata["reason"] = "no_candidate_base_vectors"
+                elasticnet_metadata["reason"] = "no_candidate_base_vectors"
             elif len(sentence_feature_rows) < 2:
                 metadata["reason"] = "not_enough_examples"
+                elasticnet_metadata["reason"] = "not_enough_examples"
             else:
                 metadata["reason"] = "single_label_only"
+                elasticnet_metadata["reason"] = "single_label_only"
 
         ranked_indices = sorted(
             range(len(candidate_base_vectors)),
@@ -457,40 +584,53 @@ class TrainSaeCrossLayerAnalyzer:
             ),
             reverse=True,
         )
-        selected_base_vectors = [
-            candidate_base_vectors[idx]
-            for idx in ranked_indices
-            if float(stability_scores[idx]) >= float(metadata.get("selection_threshold", 0.6))
-        ]
-        if not selected_base_vectors and candidate_base_vectors:
-            if ranked_indices:
-                selected_base_vectors = [candidate_base_vectors[ranked_indices[0]]]
-            else:
-                selected_base_vectors = [candidate_base_vectors[0]]
+        feature_weights = _build_ranked_feature_weights(
+            ranked_indices=ranked_indices,
+            coefficients=coefficients,
+            scores=stability_scores,
+            score_name="stability_score",
+        )
+        selections_by_count, selected_base_vectors_by_count = _build_topn_selections(
+            ranked_indices=ranked_indices,
+            ranked_feature_weights=feature_weights,
+        )
 
-        feature_weights = []
-        for rank_idx in ranked_indices:
-            if rank_idx >= len(candidate_base_vectors):
-                continue
-            base_vec = candidate_base_vectors[rank_idx]
-            stats = full_stats.get(base_vec, full_stats.get(str(base_vec), {}))
-            feature_weights.append(
-                {
-                    "base_vector": int(base_vec),
-                    "weight": float(coefficients[rank_idx]),
-                    "abs_weight": float(abs(coefficients[rank_idx])),
-                    "stability_score": float(stability_scores[rank_idx]),
-                    "selected_for_intervention": int(base_vec) in selected_base_vectors,
-                    "frc": float(stats.get("frc", 0.0)),
-                    "ps": float(stats.get("ps", 0.0)),
-                    "pn": float(stats.get("pn", 0.0)),
-                }
-            )
+        elasticnet_ranked_indices = sorted(
+            range(len(candidate_base_vectors)),
+            key=lambda idx: float(abs(elasticnet_coefficients[idx])),
+            reverse=True,
+        )
+        elasticnet_feature_weights = _build_ranked_feature_weights(
+            ranked_indices=elasticnet_ranked_indices,
+            coefficients=elasticnet_coefficients,
+            scores=np.abs(elasticnet_coefficients),
+            score_name="elasticnet_score",
+        )
+        (
+            elasticnet_selections_by_count,
+            elasticnet_selected_base_vectors_by_count,
+        ) = _build_topn_selections(
+            ranked_indices=elasticnet_ranked_indices,
+            ranked_feature_weights=elasticnet_feature_weights,
+        )
+
+        metadata["selection_counts"] = [int(count) for count in LASSO_SELECTION_COUNTS]
+        elasticnet_metadata["selection_counts"] = [
+            int(count) for count in LASSO_SELECTION_COUNTS
+        ]
 
         return {
-            "selected_base_vectors": selected_base_vectors,
+            "selected_base_vectors": selected_base_vectors_by_count.get("top_100", []),
+            "selected_base_vectors_by_count": selected_base_vectors_by_count,
             "feature_weights": feature_weights,
             "metadata": metadata,
+            "selections_by_count": selections_by_count,
+            "elasticnet_feature_weights": elasticnet_feature_weights,
+            "elasticnet_metadata": elasticnet_metadata,
+            "elasticnet_selections_by_count": elasticnet_selections_by_count,
+            "elasticnet_selected_base_vectors_by_count": (
+                elasticnet_selected_base_vectors_by_count
+            ),
         }
 
 

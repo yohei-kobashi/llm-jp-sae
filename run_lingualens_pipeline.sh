@@ -22,11 +22,7 @@ Usage:
     [--normalization Scalar] \
     [--batch-size 8] \
     [--torch-dtype bfloat16] \
-    [--device cuda:0] \
-    [--random-seed 42] \
-    [--num-generations 5] \
-    [--max-new-tokens 100] \
-    [--temperature 0.7]
+    [--device cuda:0]
 
 Required arguments:
   --target               Target modality for convert_jsonl_to_lingualens_text.py.
@@ -37,7 +33,7 @@ Required arguments:
 Optional arguments:
   --layers               Comma-separated layer indices. If omitted, auto-detected
                          from files matching SAE_PATH_TEMPLATE.
-  --start-step           Step number to start from (1-4).
+  --start-step           Step number to start from (1-3).
 EOF
 }
 
@@ -60,10 +56,6 @@ NORMALIZATION="Scalar"
 BATCH_SIZE="64"
 TORCH_DTYPE="bfloat16"
 DEVICE=""
-RANDOM_SEED=""
-NUM_GENERATIONS="5"
-MAX_NEW_TOKENS="100"
-TEMPERATURE="0.7"
 
 append_targets() {
   local raw="$1"
@@ -86,9 +78,9 @@ resolve_layers() {
   fi
 
   if (( START_STEP <= 2 )); then
-    echo "[2/4] Detecting layers from SAE template"
+    echo "[2/3] Detecting layers from SAE template"
   else
-    echo "[2/4] Skipped layer detection (--start-step=$START_STEP)"
+    echo "[2/3] Skipped layer detection (--start-step=$START_STEP)"
     echo "LAYERS is not specified, so auto-detecting layers from SAE template for downstream steps"
   fi
 
@@ -122,18 +114,14 @@ resolve_layers() {
 
 run_for_target() {
   local target="$1"
-  local target_slug target_dir data_dir crosslayer_dir intervention_dir
-  local train_txt dev_txt dev_jsonl test_txt test_jsonl feature_name
-  local layer layer_json
-  local -a layer_array=()
-  local -a missing_layer_jsons=()
+  local target_slug target_dir data_dir crosslayer_dir
+  local train_txt dev_txt dev_jsonl test_txt test_jsonl
 
   target_slug="${target// /_}"
   target_dir="${OUTPUT_ROOT%/}/${target_slug}"
   data_dir="$target_dir/data"
   crosslayer_dir="$target_dir/crosslayer"
-  intervention_dir="$target_dir/interventions"
-  mkdir -p "$data_dir" "$crosslayer_dir" "$intervention_dir"
+  mkdir -p "$data_dir" "$crosslayer_dir"
 
   train_txt="$data_dir/${target_slug}_train.txt"
   dev_txt="$data_dir/${target_slug}_dev.txt"
@@ -146,7 +134,7 @@ run_for_target() {
   echo "Output directory: $target_dir"
 
   if (( START_STEP <= 1 )); then
-    echo "[1/4] Generating train/dev/test data for target: $target"
+    echo "[1/3] Generating train/dev/test data for target: $target"
     python convert_jsonl_to_lingualens_text.py \
       --input "$INPUT_JSONL" \
       --output "$train_txt" \
@@ -159,7 +147,7 @@ run_for_target() {
       --seed "$SEED" \
       --target "$target"
   else
-    echo "[1/4] Skipped data generation (--start-step=$START_STEP)"
+    echo "[1/3] Skipped data generation (--start-step=$START_STEP)"
     if [[ ! -f "$train_txt" || ! -f "$dev_txt" || ! -f "$dev_jsonl" || ! -f "$test_txt" || ! -f "$test_jsonl" ]]; then
       echo "Missing generated data required to skip step 1." >&2
       echo "Expected files:" >&2
@@ -177,7 +165,7 @@ run_for_target() {
       echo "Missing train data required for step 3: $train_txt" >&2
       exit 1
     fi
-    echo "[3/4] Running cross-layer analysis on layers: $ALL_LAYERS"
+    echo "[3/3] Running cross-layer analysis on layers: $ALL_LAYERS"
     python crosslayer_lingualens.py \
       --model-path "$MODEL_PATH" \
       --sae-path-template "$SAE_PATH_TEMPLATE" \
@@ -192,65 +180,14 @@ run_for_target() {
       --resume \
       "${DEVICE_ARGS[@]}"
   else
-    echo "[3/4] Skipped cross-layer analysis (--start-step=$START_STEP)"
+    echo "[3/3] Skipped cross-layer analysis (--start-step=$START_STEP)"
   fi
-
-  feature_name="$(basename "${train_txt%.txt}")"
-  IFS=',' read -r -a layer_array <<< "$ALL_LAYERS"
-  missing_layer_jsons=()
-  for layer in "${layer_array[@]}"; do
-    layer_json="$crosslayer_dir/${feature_name}_layer${layer}_evolution.json"
-    if [[ ! -f "$layer_json" ]]; then
-      missing_layer_jsons+=("$layer_json")
-    fi
-  done
-
-  if [[ ${#missing_layer_jsons[@]} -gt 0 ]]; then
-    echo "Missing per-layer crosslayer outputs required for step 4:" >&2
-    for path in "${missing_layer_jsons[@]}"; do
-      echo "  $path" >&2
-    done
-    exit 1
-  fi
-
-  if [[ ! -f "$test_txt" ]]; then
-    echo "Missing test data required for step 4: $test_txt" >&2
-    exit 1
-  fi
-
-  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    echo "OPENAI_API_KEY is required for alpha tuning and LLM-as-a-Judge evaluation in step 4." >&2
-    exit 1
-  fi
-
-  echo "[4/4] Running layer-wise interventions with test prompts"
-  python intervener_lingualens.py \
-    --model-path "$MODEL_PATH" \
-    --sae-path-template "$SAE_PATH_TEMPLATE" \
-    --crosslayer-json "$crosslayer_dir" \
-    --output-dir "$intervention_dir" \
-    --selection-mode per-layer \
-    --resume \
-    --prompt-file "$test_txt" \
-    --dev-prompt-file "$dev_txt" \
-    --test-prompt-file "$test_txt" \
-    --target-modality "$target" \
-    --k "$K" \
-    --normalization "$NORMALIZATION" \
-    --torch-dtype "$TORCH_DTYPE" \
-    --batch-size "$BATCH_SIZE" \
-    --random-seed "$RANDOM_SEED" \
-    --num-generations "$NUM_GENERATIONS" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --temperature "$TEMPERATURE" \
-    "${DEVICE_ARGS[@]}"
 
   echo "Finished target: $target"
   echo "Train data: $train_txt"
   echo "Dev data: $dev_txt"
   echo "Test data: $test_txt"
   echo "Cross-layer directory: $crosslayer_dir"
-  echo "Intervention directory: $intervention_dir"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -319,22 +256,6 @@ while [[ $# -gt 0 ]]; do
       DEVICE="$2"
       shift 2
       ;;
-    --random-seed)
-      RANDOM_SEED="$2"
-      shift 2
-      ;;
-    --num-generations)
-      NUM_GENERATIONS="$2"
-      shift 2
-      ;;
-    --max-new-tokens)
-      MAX_NEW_TOKENS="$2"
-      shift 2
-      ;;
-    --temperature)
-      TEMPERATURE="$2"
-      shift 2
-      ;;
     -h|--help)
       usage
       exit 0
@@ -353,13 +274,9 @@ if [[ -z "$MODEL_PATH" || -z "$SAE_PATH_TEMPLATE" ]]; then
   exit 1
 fi
 
-if [[ ! "$START_STEP" =~ ^[1-4]$ ]]; then
-  echo "--start-step must be one of: 1, 2, 3, 4" >&2
+if [[ ! "$START_STEP" =~ ^[1-3]$ ]]; then
+  echo "--start-step must be one of: 1, 2, 3" >&2
   exit 1
-fi
-
-if [[ -z "$RANDOM_SEED" ]]; then
-  RANDOM_SEED="$SEED"
 fi
 
 if [[ ${#TARGETS[@]} -gt 1 ]]; then

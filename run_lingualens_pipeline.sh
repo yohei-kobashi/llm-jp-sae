@@ -71,6 +71,16 @@ append_targets() {
   done
 }
 
+require_arg_value() {
+  local option="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "Missing value for $option" >&2
+    usage >&2
+    exit 1
+  fi
+}
+
 resolve_layers() {
   if [[ -n "$LAYERS" ]]; then
     ALL_LAYERS="$LAYERS"
@@ -193,68 +203,148 @@ run_for_target() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)
+      require_arg_value "$1" "${2-}"
       append_targets "$2"
       shift 2
       ;;
+    --target=*)
+      append_targets "${1#*=}"
+      shift
+      ;;
     --model-path)
+      require_arg_value "$1" "${2-}"
       MODEL_PATH="$2"
       shift 2
       ;;
+    --model-path=*)
+      MODEL_PATH="${1#*=}"
+      shift
+      ;;
     --sae-path-template)
+      require_arg_value "$1" "${2-}"
       SAE_PATH_TEMPLATE="$2"
       shift 2
       ;;
+    --sae-path-template=*)
+      SAE_PATH_TEMPLATE="${1#*=}"
+      shift
+      ;;
     --layers)
+      require_arg_value "$1" "${2-}"
       LAYERS="$2"
       shift 2
       ;;
+    --layers=*)
+      LAYERS="${1#*=}"
+      shift
+      ;;
     --input-jsonl)
+      require_arg_value "$1" "${2-}"
       INPUT_JSONL="$2"
       shift 2
       ;;
+    --input-jsonl=*)
+      INPUT_JSONL="${1#*=}"
+      shift
+      ;;
     --output-root)
+      require_arg_value "$1" "${2-}"
       OUTPUT_ROOT="$2"
       shift 2
       ;;
+    --output-root=*)
+      OUTPUT_ROOT="${1#*=}"
+      shift
+      ;;
     --start-step)
+      require_arg_value "$1" "${2-}"
       START_STEP="$2"
       shift 2
       ;;
+    --start-step=*)
+      START_STEP="${1#*=}"
+      shift
+      ;;
     --dev-ratio)
+      require_arg_value "$1" "${2-}"
       DEV_RATIO="$2"
       shift 2
       ;;
+    --dev-ratio=*)
+      DEV_RATIO="${1#*=}"
+      shift
+      ;;
     --test-ratio)
+      require_arg_value "$1" "${2-}"
       TEST_RATIO="$2"
       shift 2
       ;;
+    --test-ratio=*)
+      TEST_RATIO="${1#*=}"
+      shift
+      ;;
     --seed)
+      require_arg_value "$1" "${2-}"
       SEED="$2"
       shift 2
       ;;
+    --seed=*)
+      SEED="${1#*=}"
+      shift
+      ;;
     --top-k)
+      require_arg_value "$1" "${2-}"
       TOP_K="$2"
       shift 2
       ;;
+    --top-k=*)
+      TOP_K="${1#*=}"
+      shift
+      ;;
     --k)
+      require_arg_value "$1" "${2-}"
       K="$2"
       shift 2
       ;;
+    --k=*)
+      K="${1#*=}"
+      shift
+      ;;
     --normalization)
+      require_arg_value "$1" "${2-}"
       NORMALIZATION="$2"
       shift 2
       ;;
+    --normalization=*)
+      NORMALIZATION="${1#*=}"
+      shift
+      ;;
     --batch-size)
+      require_arg_value "$1" "${2-}"
       BATCH_SIZE="$2"
       shift 2
       ;;
+    --batch-size=*)
+      BATCH_SIZE="${1#*=}"
+      shift
+      ;;
     --torch-dtype)
+      require_arg_value "$1" "${2-}"
       TORCH_DTYPE="$2"
       shift 2
       ;;
+    --torch-dtype=*)
+      TORCH_DTYPE="${1#*=}"
+      shift
+      ;;
     --device)
+      require_arg_value "$1" "${2-}"
       DEVICE="$2"
       shift 2
+      ;;
+    --device=*)
+      DEVICE="${1#*=}"
+      shift
       ;;
     -h|--help)
       usage

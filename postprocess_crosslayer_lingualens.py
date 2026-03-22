@@ -47,16 +47,33 @@ DEFAULT_OVERLAP_SELECTIONS = {
 
 
 def _collect_layer_json_paths(input_dir: str) -> List[str]:
-    paths = sorted(glob(os.path.join(input_dir, "*_layer*_evolution.json")))
+    direct_paths = glob(os.path.join(input_dir, "*_layer*_evolution.json"))
+    nested_paths = glob(
+        os.path.join(input_dir, "*", "crosslayer", "*_layer*_evolution.json")
+    )
+    paths = sorted(set(direct_paths + nested_paths))
     if not paths:
         raise FileNotFoundError(
-            f"No per-layer crosslayer JSON files found in directory: {input_dir}"
+            "No per-layer crosslayer JSON files found in directory: "
+            f"{input_dir}. Expected either '<input-dir>/*_layer*_evolution.json' "
+            "or '<input-dir>/<feature>/crosslayer/*_layer*_evolution.json'."
         )
     return paths
 
 
 def _parse_feature_name_from_path(path: str) -> str:
+    normalized_path = os.path.normpath(path)
+    path_parts = normalized_path.split(os.sep)
+    if len(path_parts) >= 3 and path_parts[-2] == "crosslayer":
+        feature_name = path_parts[-3]
+        if feature_name in MODAL_FEATURE_NAMES:
+            return feature_name
+
     name = os.path.basename(path)
+    for feature_name in sorted(MODAL_FEATURE_NAMES, key=len, reverse=True):
+        if name == f"{feature_name}.json" or name.startswith(f"{feature_name}_"):
+            return feature_name
+
     match = re.match(r"(.+)_layer\d+_evolution\.json$", name)
     if not match:
         raise ValueError(f"Unexpected per-layer filename format: {path}")

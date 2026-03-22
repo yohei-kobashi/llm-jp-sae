@@ -409,13 +409,10 @@ def _summarize_group_overlap(feature_vectors: Dict[str, List[int]]) -> Dict[str,
     return {
         "features": features,
         "feature_count": len(features),
-        "feature_vectors": normalized_vectors,
         "union_count": len(union_set),
-        "union_indices": sorted(union_set),
         "intersection_all_count": len(intersection_set),
         "intersection_all_indices": sorted(intersection_set),
         "duplicate_index_count": len(duplicate_indices),
-        "duplicate_indices": duplicate_indices,
         "overlap_histogram": overlap_histogram,
         "pairwise": pairwise,
         "mean_pairwise_jaccard": (
@@ -432,39 +429,6 @@ def _summarize_group_overlap(feature_vectors: Dict[str, List[int]]) -> Dict[str,
 
 
 
-def _summarize_suppose_vs_others(
-    suppose_vectors: List[int],
-    other_feature_vectors: Dict[str, List[int]],
-) -> Dict[str, Any]:
-    normalized_suppose = sorted({int(item) for item in suppose_vectors})
-    others_normalized = {
-        feature: sorted({int(item) for item in values})
-        for feature, values in sorted(other_feature_vectors.items())
-    }
-    others_union = sorted(
-        {
-            int(item)
-            for values in others_normalized.values()
-            for item in values
-        }
-    )
-
-    pairwise = {
-        feature: _compute_pairwise_overlap(normalized_suppose, values)
-        for feature, values in others_normalized.items()
-    }
-    union_overlap = _compute_pairwise_overlap(normalized_suppose, others_union)
-
-    return {
-        "suppose_indices": normalized_suppose,
-        "other_feature_vectors": others_normalized,
-        "others_union_indices": others_union,
-        "pairwise_against_each_feature": pairwise,
-        "suppose_vs_others_union": union_overlap,
-    }
-
-
-
 def _build_modal_overlap_summary(
     grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
     source: str,
@@ -477,27 +441,12 @@ def _build_modal_overlap_summary(
         source,
         selection_key,
     )
-    suppose_feature = "suppose"
-    other_features = [
-        feature_name for feature_name in target_features if feature_name != suppose_feature
-    ]
 
     layers = sorted(layer_feature_vectors.keys())
     layer_overlap = {}
     for layer in layers:
         feature_vectors = layer_feature_vectors[layer]
-        others_vectors = {
-            feature_name: feature_vectors.get(feature_name, [])
-            for feature_name in other_features
-        }
-        suppose_vectors = feature_vectors.get(suppose_feature, [])
-        layer_overlap[str(layer)] = {
-            "without_suppose": _summarize_group_overlap(others_vectors),
-            "suppose_vs_others": _summarize_suppose_vs_others(
-                suppose_vectors,
-                others_vectors,
-            ),
-        }
+        layer_overlap[str(layer)] = _summarize_group_overlap(feature_vectors)
 
     return {
         "target_features": target_features,

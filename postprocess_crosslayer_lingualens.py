@@ -15,7 +15,6 @@ from LinguaLens.lingualens.utils import save_json_results
 
 
 BASE_VECTOR_SOURCE_CHOICES = (
-    "auto",
     "top_features",
     "top_100_features",
     "top_100_base_vectors_desc",
@@ -221,61 +220,6 @@ def _resolve_base_vector_source(
         "selection_key": selection_key if source in {"lasso", "elasticnet"} else None,
         "base_vectors": [],
     }
-
-
-
-def _extract_layer_candidates(
-    layer_entries: List[Tuple[int, Dict[str, Any]]],
-    source: str,
-    selection_key: str,
-) -> Dict[str, Any]:
-    candidates: Dict[str, Any] = {
-        "feature_file": None,
-        "layers": [layer for layer, _ in layer_entries],
-        "candidate_source": source,
-        "selection_key": selection_key,
-        "layer_candidates": {},
-    }
-
-    for layer, data in layer_entries:
-        base_results = data.get("base_results", {})
-        if candidates["feature_file"] is None:
-            candidates["feature_file"] = base_results.get("feature_file")
-        layer_result = _get_single_layer_result(data, layer)
-        full_stats = _get_full_stats(layer_result)
-        resolved = _resolve_base_vector_source(layer_result, source, selection_key)
-        if not resolved["base_vectors"]:
-            candidates["layer_candidates"][str(layer)] = {
-                "status": resolved["status"],
-                "layer_idx": int(layer),
-                "candidate_source": resolved["source"],
-                "selection_key": resolved["selection_key"],
-            }
-            continue
-
-        base_vectors = resolved["base_vectors"]
-        primary_base_vector = int(base_vectors[0])
-        primary_stats = _get_base_vector_stats(full_stats, primary_base_vector)
-        candidates["layer_candidates"][str(layer)] = {
-            "status": "ready",
-            "layer_idx": int(layer),
-            "candidate_source": resolved["source"],
-            "selection_key": resolved["selection_key"],
-            "base_vector": primary_base_vector,
-            "base_vectors": [int(base_vec) for base_vec in base_vectors],
-            "candidate_count": len(base_vectors),
-            "frc": float(primary_stats.get("frc", 0.0)),
-            "primary_stats": {
-                "ps": float(primary_stats.get("ps", 0.0)),
-                "pn": float(primary_stats.get("pn", 0.0)),
-                "frc": float(primary_stats.get("frc", 0.0)),
-                "avg_max_activation": float(primary_stats.get("avg_max_activation", 0.0)),
-            },
-            "stability_selection": layer_result.get("stability_selection"),
-            "elasticnet_selection": layer_result.get("elasticnet_selection"),
-        }
-
-    return candidates
 
 
 
@@ -572,28 +516,10 @@ def _save_modal_overlap_summary(
 
 
 
-def _save_layer_candidates_for_all_features(
-    grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
-    output_dir: str,
-    source: str,
-    selection_key: str,
-    target_features: List[str],
-) -> None:
-    for feature_name in target_features:
-        layer_entries = grouped_layer_entries[feature_name]
-        candidates = _extract_layer_candidates(layer_entries, source, selection_key)
-        output_path = os.path.join(output_dir, f"{feature_name}_layer_candidates.json")
-        save_json_results(candidates, output_path)
-        print(f"Saved layer candidates: {output_path}")
-
-
-
 def _save_evolution_plots_for_all_features(
     grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
     output_dir: str,
     metric: str,
-    source: str,
-    selection_key: str,
     target_features: List[str],
 ) -> None:
     try:
@@ -603,29 +529,32 @@ def _save_evolution_plots_for_all_features(
             "matplotlib is required to generate plots."
         ) from exc
 
-    for feature_name in target_features:
-        layer_entries = grouped_layer_entries[feature_name]
-        evolution_results = _build_evolution_results(layer_entries, source, selection_key)
-        evolution_data = evolution_results["evolution_data"]
+    for comparison_name, (source, selection_key) in DEFAULT_OVERLAP_SELECTIONS.items():
+        for feature_name in target_features:
+            layer_entries = grouped_layer_entries[feature_name]
+            evolution_results = _build_evolution_results(layer_entries, source, selection_key)
+            evolution_data = evolution_results["evolution_data"]
 
-        plt.figure(figsize=(12, 8))
-        for base_vec, layer_stats in evolution_data["base_vector_evolution"].items():
-            if len(layer_stats) < 2:
-                continue
-            x_layers = sorted(layer_stats.keys())
-            y_values = [float(layer_stats[layer].get(metric, 0.0)) for layer in x_layers]
-            plt.plot(x_layers, y_values, marker="o", alpha=0.7, label=f"BV {base_vec}")
+            plt.figure(figsize=(12, 8))
+            for base_vec, layer_stats in evolution_data["base_vector_evolution"].items():
+                if len(layer_stats) < 2:
+                    continue
+                x_layers = sorted(layer_stats.keys())
+                y_values = [float(layer_stats[layer].get(metric, 0.0)) for layer in x_layers]
+                plt.plot(x_layers, y_values, marker="o", alpha=0.7, label=f"BV {base_vec}")
 
-        plt.xlabel("Layer Index")
-        plt.ylabel(f"{metric.upper()} Score")
-        plt.title(f"Feature Evolution Across Layers - {feature_name} - {metric.upper()}")
-        plt.grid(True, alpha=0.3)
-        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-        plt.tight_layout()
-        output_path = os.path.join(output_dir, f"{feature_name}_{metric}.png")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"Saved evolution plot: {output_path}")
+            plt.xlabel("Layer Index")
+            plt.ylabel(f"{metric.upper()} Score")
+            plt.title(
+                f"Feature Evolution Across Layers - {feature_name} - {comparison_name} - {metric.upper()}"
+            )
+            plt.grid(True, alpha=0.3)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+            plt.tight_layout()
+            output_path = os.path.join(output_dir, f"{feature_name}_{comparison_name}_{metric}.png")
+            plt.savefig(output_path, dpi=300, bbox_inches="tight")
+            plt.close()
+            print(f"Saved evolution plot: {output_path}")
 
 
 
@@ -649,42 +578,15 @@ def main() -> None:
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="Generate cross-layer plots for all modal features.",
+        help=(
+            "Generate cross-layer plots for all modal features across top100, "
+            "Lasso top10/top20/top50/top100, and ElasticNet top10/top20/top50/top100."
+        ),
     )
     parser.add_argument(
         "--plot-metric",
         default="frc",
         help="Metric key for evolution plot (default: frc).",
-    )
-    parser.add_argument(
-        "--plot-source",
-        choices=BASE_VECTOR_SOURCE_CHOICES,
-        default="top_features",
-        help="Base vector source for plotting. Default: top_features.",
-    )
-    parser.add_argument(
-        "--plot-selection-key",
-        default="top_100",
-        help="Selection key for --plot-source lasso/elasticnet (default: top_100).",
-    )
-    parser.add_argument(
-        "--export-layer-candidates",
-        action="store_true",
-        help="Export layer-candidate JSONs for all modal features.",
-    )
-    parser.add_argument(
-        "--candidate-source",
-        choices=BASE_VECTOR_SOURCE_CHOICES,
-        default="auto",
-        help="Base vector source for layer candidates. Default: auto.",
-    )
-    parser.add_argument(
-        "--candidate-selection-key",
-        default="top_100",
-        help=(
-            "Selection key for --candidate-source lasso/elasticnet "
-            "(default: top_100)."
-        ),
     )
     parser.add_argument(
         "--compare-modal-overlap",
@@ -696,9 +598,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if not args.plot and not args.export_layer_candidates and not args.compare_modal_overlap:
+    if not args.plot and not args.compare_modal_overlap:
         raise ValueError(
-            "Specify at least one of --plot, --export-layer-candidates, or --compare-modal-overlap."
+            "Specify at least one of --plot or --compare-modal-overlap."
         )
 
     output_dir = args.output_dir or args.input_dir
@@ -715,22 +617,11 @@ def main() -> None:
             target_features,
         )
 
-    if args.export_layer_candidates:
-        _save_layer_candidates_for_all_features(
-            grouped_layer_entries,
-            output_dir,
-            args.candidate_source,
-            args.candidate_selection_key,
-            target_features,
-        )
-
     if args.plot:
         _save_evolution_plots_for_all_features(
             grouped_layer_entries,
             output_dir,
             args.plot_metric,
-            args.plot_source,
-            args.plot_selection_key,
             target_features,
         )
 

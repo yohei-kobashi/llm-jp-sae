@@ -70,10 +70,16 @@ def target_keys(target: str) -> tuple[str, str, str]:
             "S1_modality_removed_acceptable",
             "S1_modality_removed_acceptability_reason",
         )
+    if target == "s2":
+        return (
+            "S2_suppose_that",
+            "S2_suppose_that_acceptable",
+            "S2_suppose_that_acceptability_reason",
+        )
     return (
-        "S2_suppose_that",
-        "S2_suppose_that_acceptable",
-        "S2_suppose_that_acceptability_reason",
+        "S3_i_know_that",
+        "S3_i_know_that_acceptable",
+        "S3_i_know_that_acceptability_reason",
     )
 
 
@@ -103,7 +109,7 @@ def process_line(line_index: int, line: str, target: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Judge acceptability of output S1/S2 sentence and append results to JSONL."
+        description="Judge acceptability of output S1/S2/S3 sentence and append results to JSONL."
     )
     parser.add_argument(
         "--input",
@@ -128,9 +134,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--target",
-        choices=["s1", "s2"],
+        choices=["s1", "s2", "s3"],
         default="s2",
-        help="Sentence target to judge: s1=output.S1_modality_removed, s2=output.S2_suppose_that (default: s2)",
+        help="Sentence target to judge: s1=output.S1_modality_removed, s2=output.S2_suppose_that, s3=output.S3_i_know_that (default: s2)",
     )
 
     args = parser.parse_args()

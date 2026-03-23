@@ -25,6 +25,13 @@ def _extract_pair(data: dict, target: str) -> tuple[str | None, str | None]:
             return input_data.get("text"), pair_text
         return None, None
 
+    if target == "know":
+        acceptable = output.get("S3_i_know_that_acceptable")
+        pair_text = output.get("S3_i_know_that")
+        if acceptable:
+            return input_data.get("text"), pair_text
+        return None, None
+
     acceptable = output.get("S1_modality_removed_acceptable")
     pair_text = output.get("S1_modality_removed")
     modal = input_data.get("Modal_Verb")
@@ -87,9 +94,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--target",
-        choices=["will", "can", "could", "may", "might", "must", "shall", "should", "would", "ought to", "suppose"],
+        choices=["will", "can", "could", "may", "might", "must", "shall", "should", "would", "ought to", "suppose", "know"],
         default="will",
-        help="Modal verb target to judge",
+        help="Modal verb target to convert; use suppose for S2_suppose_that and know for S3_i_know_that",
     )
 
     args = parser.parse_args()

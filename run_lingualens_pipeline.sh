@@ -26,6 +26,7 @@ Usage:
 
 Required arguments:
   --target               Target modality for convert_jsonl_to_lingualens_text.py.
+                         Supports modal targets plus suppose and know.
                          Can be passed multiple times and/or as a comma-separated list.
   --model-path           Base model path or Hugging Face model name
   --sae-path-template    SAE template such as sae/.../sae_layer{}.pth
@@ -37,7 +38,7 @@ Optional arguments:
 EOF
 }
 
-# ["will", "can", "could", "may", "might", "must", "should", "would", "suppose"]
+# ["will", "can", "could", "may", "might", "must", "should", "would", "ought to", "suppose", "know"]
 TARGETS=("will")
 # llm-jp/llm-jp-3-1.8b, allenai/OLMo-2-0425-1B, meta-llama/Llama-3.2-1B, Qwen/Qwen2.5-1.5B
 MODEL_PATH="llm-jp/llm-jp-3-1.8b"

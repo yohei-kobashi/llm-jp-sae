@@ -1,4 +1,40 @@
 #!/usr/bin/env python3
+"""
+Postprocess per-layer outputs produced by `crosslayer_lingualens.py`.
+
+This script aggregates multiple per-layer JSON files across a target feature set
+such as modal verbs, `suppose`, and `know`, and then builds higher-level
+analysis artifacts from precomputed base-vector selections.
+
+Current comparison sets are derived from `top_100_features` and include:
+  - top3
+  - top5
+  - top10
+  - top20
+  - top50
+  - top100
+
+Main functions:
+  - Generate layer-wise overlap summaries across features.
+  - Run hierarchical clustering from Jaccard distances between feature-wise
+    base-vector sets.
+  - Save per-feature cross-layer evolution plots for the selected comparison sets.
+
+Typical usage:
+  python postprocess_crosslayer_lingualens.py \
+      --input-dir /path/to/per_feature_outputs \
+      --output-dir /path/to/postprocessed_outputs \
+      --compare-modal-overlap \
+      --cluster-hierarchical \
+      --plot
+
+Expected input layout:
+  - /input_dir/*_layer*_evolution.json
+  - or /input_dir/<feature>/crosslayer/*_layer*_evolution.json
+
+The script reads the per-layer JSONs, groups them by feature name, and writes
+summary JSON files and optional figures into `--output-dir`.
+"""
 
 from __future__ import annotations
 
@@ -18,9 +54,6 @@ BASE_VECTOR_SOURCE_CHOICES = (
     "top_features",
     "top_100_features",
     "top_100_base_vectors_desc",
-    "intervention_features",
-    "lasso",
-    "elasticnet",
 )
 DEFAULT_TARGET_FEATURE_NAMES = (
     "will",
@@ -38,16 +71,12 @@ FEATURE_ORDER_PRIORITY = {
     name: idx for idx, name in enumerate(DEFAULT_TARGET_FEATURE_NAMES)
 }
 DEFAULT_OVERLAP_SELECTIONS = {
-    "top3": ("top_features", "top_3"),
+    "top3": ("top_100_features", "top_3"),
+    "top5": ("top_100_features", "top_5"),
+    "top10": ("top_100_features", "top_10"),
+    "top20": ("top_100_features", "top_20"),
+    "top50": ("top_100_features", "top_50"),
     "top100": ("top_100_features", "top_100"),
-    "lasso_top10": ("lasso", "top_10"),
-    "lasso_top20": ("lasso", "top_20"),
-    "lasso_top50": ("lasso", "top_50"),
-    "lasso_top100": ("lasso", "top_100"),
-    "elasticnet_top10": ("elasticnet", "top_10"),
-    "elasticnet_top20": ("elasticnet", "top_20"),
-    "elasticnet_top50": ("elasticnet", "top_50"),
-    "elasticnet_top100": ("elasticnet", "top_100"),
 }
 
 
@@ -192,11 +221,17 @@ def _resolve_base_vector_source(
     source: str,
     selection_key: str,
 ) -> Dict[str, Any]:
+    supported_topn_selection_keys = {
+        "top_3",
+        "top_5",
+        "top_10",
+        "top_20",
+        "top_50",
+        "top_100",
+    }
+
     if source == "auto":
         source_candidates = [
-            "intervention_features",
-            "lasso",
-            "elasticnet",
             "top_100_base_vectors_desc",
             "top_100_features",
             "top_features",
@@ -209,34 +244,23 @@ def _resolve_base_vector_source(
             base_vectors = _extract_base_vectors_from_feature_pairs(
                 layer_result.get("top_features", [])
             )
-            if selection_key == "top_3":
-                base_vectors = base_vectors[:3]
+            if selection_key in supported_topn_selection_keys:
+                selection_count = int(selection_key.split("_")[1])
+                base_vectors = base_vectors[:selection_count]
         elif candidate_source == "top_100_features":
             base_vectors = _extract_base_vectors_from_feature_pairs(
                 layer_result.get("top_100_features", [])
             )
+            if selection_key in supported_topn_selection_keys:
+                selection_count = int(selection_key.split("_")[1])
+                base_vectors = base_vectors[:selection_count]
         elif candidate_source == "top_100_base_vectors_desc":
             base_vectors = _extract_base_vectors_from_scalar_list(
                 layer_result.get("top_100_base_vectors_desc", [])
             )
-        elif candidate_source == "intervention_features":
-            base_vectors = _extract_base_vectors_from_scalar_list(
-                layer_result.get("intervention_features", [])
-            )
-        elif candidate_source == "lasso":
-            lasso_selected = layer_result.get("lasso_selected_base_vectors", {})
-            base_vectors = _extract_base_vectors_from_scalar_list(
-                lasso_selected.get(selection_key, [])
-                if isinstance(lasso_selected, dict)
-                else []
-            )
-        elif candidate_source == "elasticnet":
-            elasticnet_selected = layer_result.get("elasticnet_selected_base_vectors", {})
-            base_vectors = _extract_base_vectors_from_scalar_list(
-                elasticnet_selected.get(selection_key, [])
-                if isinstance(elasticnet_selected, dict)
-                else []
-            )
+            if selection_key in supported_topn_selection_keys:
+                selection_count = int(selection_key.split("_")[1])
+                base_vectors = base_vectors[:selection_count]
         else:
             raise ValueError(f"Unsupported base vector source: {candidate_source}")
 
@@ -244,16 +268,14 @@ def _resolve_base_vector_source(
             return {
                 "status": "ready",
                 "source": candidate_source,
-                "selection_key": selection_key
-                if candidate_source in {"lasso", "elasticnet"}
-                else None,
+                "selection_key": selection_key,
                 "base_vectors": base_vectors,
             }
 
     return {
         "status": "missing_candidates",
         "source": source,
-        "selection_key": selection_key if source in {"lasso", "elasticnet"} else None,
+        "selection_key": selection_key,
         "base_vectors": [],
     }
 
@@ -848,8 +870,8 @@ def main() -> None:
         "--plot",
         action="store_true",
         help=(
-            "Generate cross-layer plots for all target features across top3, top100, "
-            "Lasso top10/top20/top50/top100, and ElasticNet top10/top20/top50/top100."
+            "Generate cross-layer plots for all target features across top3, top5, "
+            "top10, top20, top50, and top100."
         ),
     )
     parser.add_argument(
@@ -861,8 +883,8 @@ def main() -> None:
         "--compare-modal-overlap",
         action="store_true",
         help=(
-            "Compare layer-wise index overlap across the target feature set for top3, top100, "
-            "Lasso, and ElasticNet."
+            "Compare layer-wise index overlap across the target feature set for top3, "
+            "top5, top10, top20, top50, and top100."
         ),
     )
     parser.add_argument(

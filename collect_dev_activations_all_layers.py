@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from glob import glob
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import torch
@@ -13,7 +13,6 @@ import torch
 from analyzer_lingualens import TrainSaeLinguisticAnalyzer
 from LinguaLens.lingualens.utils import load_text_data, save_json_results
 from model import normalize_activation
-
 
 
 def _parse_torch_dtype(dtype_name: str) -> torch.dtype:
@@ -90,26 +89,32 @@ class DevActivationCollector:
         layer_modules = self.analyzer._resolve_layer_modules()
         return list(range(0, len(layer_modules["layers"]) + 1))
 
-    def collect_layer_rows(
+    def collect_all_layer_rows(
         self,
-        layer_idx: int,
+        layers: List[int],
         target_assets: Dict[str, Dict[str, str]],
-    ) -> List[Dict[str, Any]]:
-        runtime = self.analyzer._get_sae_model(layer_idx)
+    ) -> Dict[int, List[Dict[str, Any]]]:
         model = self.analyzer._load_base_model()
-        sae = runtime["sae"]
-        hook = runtime["hook"]
-        collected_rows: List[Dict[str, Any]] = []
+        runtimes = {int(layer): self.analyzer._get_sae_model(int(layer)) for layer in layers}
+        collected_rows_by_layer: Dict[int, List[Dict[str, Any]]] = {
+            int(layer): [] for layer in layers
+        }
 
-        for target_name, assets in sorted(target_assets.items()):
+        sorted_targets = sorted(target_assets.items())
+        for target_position, (target_name, assets) in enumerate(sorted_targets, start=1):
             lines = load_text_data(assets["split_path"])
             total_batches = max(1, (len(lines) + self.batch_size - 1) // self.batch_size)
             log_interval = max(1, total_batches // 10)
+            print(
+                f"[collect] target {target_position}/{len(sorted_targets)} start: "
+                f"{target_name}, lines={len(lines)}, batches={total_batches}"
+            )
 
             for batch_idx, start in enumerate(range(0, len(lines), self.batch_size), start=1):
                 if batch_idx == 1 or batch_idx == total_batches or batch_idx % log_interval == 0:
                     print(
-                        f"[layer {layer_idx}] {target_name}: batch {batch_idx}/{total_batches} "
+                        f"[collect] target {target_position}/{len(sorted_targets)} "
+                        f"batch {batch_idx}/{total_batches}: {target_name} "
                         f"(examples {start + 1}-{min(start + self.batch_size, len(lines))}/{len(lines)})"
                     )
 
@@ -129,59 +134,77 @@ class DevActivationCollector:
                 with torch.no_grad():
                     _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
-                acts = hook.output
-                if isinstance(acts, tuple):
-                    acts = acts[0]
-                if acts.dim() == 2:
-                    acts = acts.unsqueeze(0)
-                acts = acts[:, 1:, :]
                 token_mask = attention_mask[:, 1:]
+                batch_pooled_by_layer: Dict[int, List[Dict[int, float]]] = {
+                    int(layer): [dict() for _ in range(input_ids.size(0))]
+                    for layer in layers
+                }
+
+                for layer in layers:
+                    runtime = runtimes[int(layer)]
+                    sae = runtime["sae"]
+                    hook = runtime["hook"]
+
+                    acts = hook.output
+                    if isinstance(acts, tuple):
+                        acts = acts[0]
+                    if acts.dim() == 2:
+                        acts = acts.unsqueeze(0)
+                    acts = acts[:, 1:, :]
+
+                    for row_idx in range(input_ids.size(0)):
+                        valid_len = int(token_mask[row_idx].sum().item())
+                        pooled_latent_acts = batch_pooled_by_layer[int(layer)][row_idx]
+                        if valid_len > 0:
+                            activation = acts[row_idx, :valid_len, :]
+                            activation = normalize_activation(activation, self.normalization)
+                            activation = activation.to(self.analyzer.device)
+                            with torch.no_grad():
+                                out = sae(activation)
+                            top_indices = out.latent_indices.detach().cpu().tolist()
+                            top_acts = out.latent_acts.detach().cpu().tolist()
+                            for token_indices, token_values in zip(top_indices, top_acts):
+                                for base_vector, value in zip(token_indices, token_values):
+                                    value = float(value)
+                                    if value <= 0.0:
+                                        continue
+                                    base_vector = int(base_vector)
+                                    current = pooled_latent_acts.get(base_vector, 0.0)
+                                    if value > current:
+                                        pooled_latent_acts[base_vector] = value
+
+                    hook.output = None
 
                 for row_idx in range(input_ids.size(0)):
-                    valid_len = int(token_mask[row_idx].sum().item())
-                    pooled_latent_acts: Dict[int, float] = {}
-                    if valid_len > 0:
-                        activation = acts[row_idx, :valid_len, :]
-                        activation = normalize_activation(activation, self.normalization)
-                        activation = activation.to(self.analyzer.device)
-                        with torch.no_grad():
-                            out = sae(activation)
-                        top_indices = out.latent_indices.detach().cpu().tolist()
-                        top_acts = out.latent_acts.detach().cpu().tolist()
-                        for token_indices, token_values in zip(top_indices, top_acts):
-                            for base_vector, value in zip(token_indices, token_values):
-                                value = float(value)
-                                if value <= 0.0:
-                                    continue
-                                base_vector = int(base_vector)
-                                current = pooled_latent_acts.get(base_vector, 0.0)
-                                if value > current:
-                                    pooled_latent_acts[base_vector] = value
-
                     line_idx = start + row_idx
                     line_number = line_idx + 1
                     pair_id = line_idx // 2
-                    sorted_latents = sorted(pooled_latent_acts.items())
-                    collected_rows.append(
-                        {
-                            "target": target_name,
-                            "source_path": assets["split_path"],
-                            "layer": int(layer_idx),
-                            "line_index": int(line_idx),
-                            "line_number": int(line_number),
-                            "pair_id": int(pair_id),
-                            "pair_key": f"{target_name}::{pair_id}",
-                            "label": 1 if line_number % 2 == 1 else 0,
-                            "line_type": "original" if line_number % 2 == 1 else "minimal_pair",
-                            "text": batch_lines[row_idx],
-                            "pooled_latent_indices": [latent for latent, _ in sorted_latents],
-                            "pooled_latent_acts": [act for _, act in sorted_latents],
-                            "active_latent_count": len(sorted_latents),
-                        }
-                    )
-                hook.output = None
+                    for layer in layers:
+                        pooled_latent_acts = batch_pooled_by_layer[int(layer)][row_idx]
+                        sorted_latents = sorted(pooled_latent_acts.items())
+                        collected_rows_by_layer[int(layer)].append(
+                            {
+                                "target": target_name,
+                                "source_path": assets["split_path"],
+                                "layer": int(layer),
+                                "line_index": int(line_idx),
+                                "line_number": int(line_number),
+                                "pair_id": int(pair_id),
+                                "pair_key": f"{target_name}::{pair_id}",
+                                "label": 1 if line_number % 2 == 1 else 0,
+                                "line_type": "original" if line_number % 2 == 1 else "minimal_pair",
+                                "text": batch_lines[row_idx],
+                                "pooled_latent_indices": [latent for latent, _ in sorted_latents],
+                                "pooled_latent_acts": [act for _, act in sorted_latents],
+                                "active_latent_count": len(sorted_latents),
+                            }
+                        )
 
-        return collected_rows
+            print(
+                f"[collect] target {target_position}/{len(sorted_targets)} done: {target_name}"
+            )
+
+        return collected_rows_by_layer
 
     def clear_cache(self) -> None:
         self.analyzer.clear_cache()
@@ -235,6 +258,10 @@ def main() -> None:
 
     try:
         layers = collector.infer_all_layers()
+        print(
+            f"[collect] start: split={args.split}, targets={len(target_assets)}, "
+            f"layers={len(layers)}, batch_size={args.batch_size}"
+        )
         run_summary: Dict[str, Any] = {
             "model_path": args.model_path,
             "input_dir": args.input_dir,
@@ -245,9 +272,11 @@ def main() -> None:
             "layer_outputs": {},
         }
 
-        for layer_idx in layers:
-            print(f"[collect] collecting activations for layer {layer_idx}")
-            layer_rows = collector.collect_layer_rows(layer_idx, target_assets)
+        collected_rows_by_layer = collector.collect_all_layer_rows(layers, target_assets)
+
+        print(f"[save] start: layers={len(layers)}")
+        for layer_position, layer_idx in enumerate(layers, start=1):
+            layer_rows = collected_rows_by_layer[int(layer_idx)]
             output_path = os.path.join(
                 activations_dir,
                 f"layer{layer_idx}_{args.split}_activations.parquet",
@@ -257,11 +286,14 @@ def main() -> None:
                 "num_rows": len(layer_rows),
                 "activations_path": output_path,
             }
-            print(f"Saved activations: {output_path}")
+            print(
+                f"[save] layer {layer_position}/{len(layers)} done: "
+                f"layer={layer_idx}, rows={len(layer_rows)}, saved={output_path}"
+            )
 
         summary_path = os.path.join(output_dir, "activation_collection_summary.json")
         save_json_results(run_summary, summary_path)
-        print(f"Saved activation collection summary: {summary_path}")
+        print(f"[save] finished: summary={summary_path}")
     finally:
         collector.clear_cache()
 

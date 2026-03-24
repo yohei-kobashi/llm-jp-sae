@@ -25,7 +25,7 @@ LM_SAES_SRC = os.path.join(PROJECT_ROOT, "Language-Model-SAEs", "src")
 if LM_SAES_SRC not in sys.path:
     sys.path.insert(0, LM_SAES_SRC)
 
-from lm_saes.models.sparse_dictionary import SparseDictionary
+from lm_saes.abstract_sae import SparseDictionary
 from transformer_lens import HookedTransformer
 
 

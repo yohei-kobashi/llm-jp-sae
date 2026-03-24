@@ -38,7 +38,7 @@ Optional arguments:
 EOF
 }
 
-# ["will", "can", "could", "may", "might", "must", "should", "would", "ought to", "suppose", "know"]
+# ["will", "can", "could", "may", "might", "must", "should", "would", "suppose", "know"]
 TARGETS=("will")
 # llm-jp/llm-jp-3-1.8b, allenai/OLMo-2-0425-1B, meta-llama/Llama-3.2-1B, Qwen/Qwen2.5-1.5B
 MODEL_PATH="llm-jp/llm-jp-3-1.8b"

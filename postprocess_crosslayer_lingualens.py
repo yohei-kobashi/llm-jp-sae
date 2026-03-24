@@ -9,7 +9,7 @@ import os
 import re
 from collections import Counter, defaultdict
 from glob import glob
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from LinguaLens.lingualens.utils import save_json_results
 
@@ -22,7 +22,7 @@ BASE_VECTOR_SOURCE_CHOICES = (
     "lasso",
     "elasticnet",
 )
-MODAL_FEATURE_NAMES = (
+DEFAULT_TARGET_FEATURE_NAMES = (
     "will",
     "can",
     "could",
@@ -32,8 +32,13 @@ MODAL_FEATURE_NAMES = (
     "should",
     "would",
     "suppose",
+    "know",
 )
+FEATURE_ORDER_PRIORITY = {
+    name: idx for idx, name in enumerate(DEFAULT_TARGET_FEATURE_NAMES)
+}
 DEFAULT_OVERLAP_SELECTIONS = {
+    "top3": ("top_features", "top_3"),
     "top100": ("top_100_features", "top_100"),
     "lasso_top10": ("lasso", "top_10"),
     "lasso_top20": ("lasso", "top_20"),
@@ -65,12 +70,10 @@ def _parse_feature_name_from_path(path: str) -> str:
     normalized_path = os.path.normpath(path)
     path_parts = normalized_path.split(os.sep)
     if len(path_parts) >= 3 and path_parts[-2] == "crosslayer":
-        feature_name = path_parts[-3]
-        if feature_name in MODAL_FEATURE_NAMES:
-            return feature_name
+        return path_parts[-3]
 
     name = os.path.basename(path)
-    for feature_name in sorted(MODAL_FEATURE_NAMES, key=len, reverse=True):
+    for feature_name in sorted(DEFAULT_TARGET_FEATURE_NAMES, key=len, reverse=True):
         if name == f"{feature_name}.json" or name.startswith(f"{feature_name}_"):
             return feature_name
 
@@ -117,6 +120,25 @@ def _validate_required_modal_features(
         )
 
 
+def _sort_feature_names(feature_names: List[str]) -> List[str]:
+    return sorted(
+        feature_names,
+        key=lambda name: (FEATURE_ORDER_PRIORITY.get(name, len(FEATURE_ORDER_PRIORITY)), name),
+    )
+
+
+def _resolve_target_features(
+    grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
+    explicit_features: Optional[List[str]],
+) -> List[str]:
+    if explicit_features:
+        target_features = explicit_features
+    else:
+        target_features = list(grouped_layer_entries.keys())
+    target_features = _sort_feature_names(target_features)
+    _validate_required_modal_features(grouped_layer_entries, target_features)
+    return target_features
+
 
 def _get_single_layer_result(data: Dict[str, Any], layer: int) -> Dict[str, Any]:
     base_results = data.get("base_results", {})
@@ -124,11 +146,9 @@ def _get_single_layer_result(data: Dict[str, Any], layer: int) -> Dict[str, Any]
     return layer_results.get(layer, layer_results.get(str(layer), {}))
 
 
-
 def _get_full_stats(layer_result: Dict[str, Any]) -> Dict[str, Any]:
     full_stats = layer_result.get("full_stats", {})
     return full_stats if isinstance(full_stats, dict) else {}
-
 
 
 def _get_base_vector_stats(
@@ -137,7 +157,6 @@ def _get_base_vector_stats(
 ) -> Dict[str, Any]:
     stats = full_stats.get(base_vec, full_stats.get(str(base_vec), {}))
     return stats if isinstance(stats, dict) else {}
-
 
 
 def _extract_base_vectors_from_feature_pairs(items: Any) -> List[int]:
@@ -155,7 +174,6 @@ def _extract_base_vectors_from_feature_pairs(items: Any) -> List[int]:
     return base_vectors
 
 
-
 def _extract_base_vectors_from_scalar_list(items: Any) -> List[int]:
     base_vectors: List[int] = []
     if not isinstance(items, list):
@@ -167,7 +185,6 @@ def _extract_base_vectors_from_scalar_list(items: Any) -> List[int]:
         except (TypeError, ValueError):
             continue
     return base_vectors
-
 
 
 def _resolve_base_vector_source(
@@ -192,6 +209,8 @@ def _resolve_base_vector_source(
             base_vectors = _extract_base_vectors_from_feature_pairs(
                 layer_result.get("top_features", [])
             )
+            if selection_key == "top_3":
+                base_vectors = base_vectors[:3]
         elif candidate_source == "top_100_features":
             base_vectors = _extract_base_vectors_from_feature_pairs(
                 layer_result.get("top_100_features", [])
@@ -239,7 +258,6 @@ def _resolve_base_vector_source(
     }
 
 
-
 def _compute_cross_layer_stats(evolution_data: Dict[str, Any]) -> Dict[str, Any]:
     stats = {
         "layer_overlap": {},
@@ -278,7 +296,6 @@ def _compute_cross_layer_stats(evolution_data: Dict[str, Any]) -> Dict[str, Any]
         }
 
     return stats
-
 
 
 def _build_evolution_results(
@@ -334,7 +351,6 @@ def _build_evolution_results(
     }
 
 
-
 def _group_vectors_by_feature_and_layer(
     grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
     features: List[str],
@@ -354,7 +370,6 @@ def _group_vectors_by_feature_and_layer(
     return dict(sorted(layer_feature_vectors.items()))
 
 
-
 def _compute_pairwise_overlap(list_a: List[int], list_b: List[int]) -> Dict[str, Any]:
     set_a = set(int(item) for item in list_a)
     set_b = set(int(item) for item in list_b)
@@ -368,7 +383,6 @@ def _compute_pairwise_overlap(list_a: List[int], list_b: List[int]) -> Dict[str,
         "coverage_a": len(intersection) / len(set_a) if set_a else 0.0,
         "coverage_b": len(intersection) / len(set_b) if set_b else 0.0,
     }
-
 
 
 def _summarize_group_overlap(feature_vectors: Dict[str, List[int]]) -> Dict[str, Any]:
@@ -428,7 +442,6 @@ def _summarize_group_overlap(feature_vectors: Dict[str, List[int]]) -> Dict[str,
     }
 
 
-
 def _build_modal_overlap_summary(
     grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
     source: str,
@@ -457,6 +470,225 @@ def _build_modal_overlap_summary(
     }
 
 
+def _build_jaccard_distance_matrix(
+    feature_vectors: Dict[str, List[int]],
+    features: List[str],
+) -> Tuple[List[List[float]], Dict[str, Dict[str, List[int]]]]:
+    distance_matrix: List[List[float]] = []
+    pairwise_intersections: Dict[str, Dict[str, List[int]]] = {
+        feature: {} for feature in features
+    }
+
+    for feature_a in features:
+        row = []
+        for feature_b in features:
+            overlap = _compute_pairwise_overlap(
+                feature_vectors.get(feature_a, []),
+                feature_vectors.get(feature_b, []),
+            )
+            row.append(1.0 - float(overlap["jaccard_similarity"]))
+            pairwise_intersections[feature_a][feature_b] = list(overlap["intersection"])
+        distance_matrix.append(row)
+
+    return distance_matrix, pairwise_intersections
+
+
+def _labels_to_clusters(features: List[str], cluster_labels: List[int]) -> Dict[str, List[str]]:
+    clusters: Dict[int, List[str]] = defaultdict(list)
+    for feature_name, cluster_label in zip(features, cluster_labels):
+        clusters[int(cluster_label)].append(feature_name)
+    return {
+        str(cluster_id): sorted(cluster_features)
+        for cluster_id, cluster_features in sorted(clusters.items())
+    }
+
+
+def _evaluate_realis_vs_irrealis(
+    features: List[str],
+    cluster_labels: List[int],
+    realis_feature: str = "know",
+) -> Dict[str, Any]:
+    if realis_feature not in features:
+        return {
+            "evaluated": False,
+            "reason": f"Missing realis feature: {realis_feature}",
+            "passed": False,
+        }
+
+    irrealis_features = [feature for feature in features if feature != realis_feature]
+    if not irrealis_features:
+        return {
+            "evaluated": False,
+            "reason": "No irrealis features available",
+            "passed": False,
+        }
+
+    cluster_map = dict(zip(features, cluster_labels))
+    realis_cluster = cluster_map[realis_feature]
+    irrealis_clusters = {cluster_map[feature] for feature in irrealis_features}
+    passed = realis_cluster not in irrealis_clusters and len(irrealis_clusters) == 1
+    return {
+        "evaluated": True,
+        "realis_feature": realis_feature,
+        "irrealis_features": irrealis_features,
+        "realis_cluster": int(realis_cluster),
+        "irrealis_clusters": sorted(int(cluster_id) for cluster_id in irrealis_clusters),
+        "passed": passed,
+    }
+
+
+def _evaluate_suppose_vs_modal_verbs(
+    irrealis_features: List[str],
+    cluster_labels: List[int],
+    suppose_feature: str = "suppose",
+) -> Dict[str, Any]:
+    if suppose_feature not in irrealis_features:
+        return {
+            "evaluated": False,
+            "reason": f"Missing irrealis split anchor: {suppose_feature}",
+            "passed": False,
+        }
+
+    modal_features = [feature for feature in irrealis_features if feature != suppose_feature]
+    if not modal_features:
+        return {
+            "evaluated": False,
+            "reason": "No modal verb features available inside irrealis set",
+            "passed": False,
+        }
+
+    cluster_map = dict(zip(irrealis_features, cluster_labels))
+    suppose_cluster = cluster_map[suppose_feature]
+    modal_clusters = {cluster_map[feature] for feature in modal_features}
+    passed = suppose_cluster not in modal_clusters and len(modal_clusters) == 1
+    return {
+        "evaluated": True,
+        "suppose_feature": suppose_feature,
+        "modal_features": modal_features,
+        "suppose_cluster": int(suppose_cluster),
+        "modal_clusters": sorted(int(cluster_id) for cluster_id in modal_clusters),
+        "passed": passed,
+    }
+
+
+def _cluster_features_from_distance_matrix(
+    feature_vectors: Dict[str, List[int]],
+    features: List[str],
+    linkage_method: str,
+    flat_k: int,
+) -> Dict[str, Any]:
+    if len(features) < 2:
+        return {
+            "features": features,
+            "distance_matrix": [],
+            "pairwise_intersections": {},
+            "linkage_method": linkage_method,
+            "linkage_matrix": [],
+            "leaf_order": features,
+            "flat_clusters": {},
+            "cluster_labels": [],
+        }
+
+    import numpy as np
+    from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
+    from scipy.spatial.distance import squareform
+
+    distance_matrix, pairwise_intersections = _build_jaccard_distance_matrix(
+        feature_vectors,
+        features,
+    )
+    condensed = squareform(np.array(distance_matrix, dtype=float), checks=False)
+    linkage_matrix = linkage(condensed, method=linkage_method)
+    cluster_labels = fcluster(linkage_matrix, t=flat_k, criterion="maxclust").tolist()
+    leaf_indices = leaves_list(linkage_matrix).tolist()
+
+    return {
+        "features": features,
+        "distance_matrix": distance_matrix,
+        "pairwise_intersections": pairwise_intersections,
+        "linkage_method": linkage_method,
+        "linkage_matrix": linkage_matrix.tolist(),
+        "leaf_order": [features[idx] for idx in leaf_indices],
+        "flat_clusters": _labels_to_clusters(features, cluster_labels),
+        "cluster_labels": [int(label) for label in cluster_labels],
+    }
+
+
+def _build_hierarchical_clustering_summary(
+    grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
+    source: str,
+    selection_key: str,
+    target_features: List[str],
+) -> Dict[str, Any]:
+    layer_feature_vectors = _group_vectors_by_feature_and_layer(
+        grouped_layer_entries,
+        target_features,
+        source,
+        selection_key,
+    )
+
+    linkage_methods = ("average", "complete", "single")
+    layers = sorted(layer_feature_vectors.keys())
+    layer_clusterings: Dict[str, Any] = {}
+
+    for layer in layers:
+        feature_vectors = layer_feature_vectors[layer]
+        present_features = _sort_feature_names(
+            [feature for feature in target_features if feature in feature_vectors]
+        )
+        irrealis_features = [feature for feature in present_features if feature != "know"]
+
+        linkage_results: Dict[str, Any] = {}
+        for linkage_method in linkage_methods:
+            all_feature_result = _cluster_features_from_distance_matrix(
+                feature_vectors,
+                present_features,
+                linkage_method,
+                flat_k=2,
+            )
+            irrealis_result = _cluster_features_from_distance_matrix(
+                feature_vectors,
+                irrealis_features,
+                linkage_method,
+                flat_k=2,
+            )
+
+            linkage_results[linkage_method] = {
+                "all_features": {
+                    key: value
+                    for key, value in all_feature_result.items()
+                    if key != "cluster_labels"
+                },
+                "irrealis_only": {
+                    key: value
+                    for key, value in irrealis_result.items()
+                    if key != "cluster_labels"
+                },
+                "evaluations": {
+                    "realis_vs_irrealis": _evaluate_realis_vs_irrealis(
+                        present_features,
+                        all_feature_result["cluster_labels"],
+                    ),
+                    "suppose_vs_modal_verbs_within_irrealis": _evaluate_suppose_vs_modal_verbs(
+                        irrealis_features,
+                        irrealis_result["cluster_labels"],
+                    ),
+                },
+            }
+
+        layer_clusterings[str(layer)] = {
+            "present_features": present_features,
+            "linkage_methods": linkage_results,
+        }
+
+    return {
+        "target_features": target_features,
+        "candidate_source": source,
+        "selection_key": selection_key,
+        "layers": layers,
+        "layer_clusterings": layer_clusterings,
+    }
+
 
 def _save_modal_overlap_summary(
     grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
@@ -480,6 +712,79 @@ def _save_modal_overlap_summary(
     save_json_results(overlap_summary, output_path)
     print(f"Saved modal overlap summary: {output_path}")
 
+
+def _save_hierarchical_dendrograms(
+    clustering_summary: Dict[str, Any],
+    output_dir: str,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required to generate hierarchical clustering figures."
+        ) from exc
+
+    import numpy as np
+    from scipy.cluster.hierarchy import dendrogram
+
+    figures_dir = os.path.join(output_dir, "hierarchical_clustering_figures")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    for comparison_name, comparison_summary in clustering_summary["comparisons"].items():
+        for layer, layer_summary in comparison_summary["layer_clusterings"].items():
+            for linkage_method, linkage_summary in layer_summary["linkage_methods"].items():
+                for scope_name in ("all_features", "irrealis_only"):
+                    scope_summary = linkage_summary[scope_name]
+                    features = scope_summary.get("features", [])
+                    linkage_matrix = scope_summary.get("linkage_matrix", [])
+                    if len(features) < 2 or not linkage_matrix:
+                        continue
+
+                    plt.figure(figsize=(10, 6))
+                    dendrogram(
+                        np.array(linkage_matrix, dtype=float),
+                        labels=features,
+                        leaf_rotation=45,
+                        leaf_font_size=10,
+                    )
+                    plt.title(
+                        f"Hierarchical Clustering - {comparison_name} - layer {layer} - {linkage_method} - {scope_name}"
+                    )
+                    plt.ylabel("Jaccard Distance")
+                    plt.tight_layout()
+                    output_path = os.path.join(
+                        figures_dir,
+                        f"{comparison_name}_layer{layer}_{linkage_method}_{scope_name}.png",
+                    )
+                    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+                    plt.close()
+                    print(f"Saved hierarchical clustering figure: {output_path}")
+
+
+def _save_hierarchical_clustering_summary(
+    grouped_layer_entries: Dict[str, List[Tuple[int, Dict[str, Any]]]],
+    output_dir: str,
+    target_features: List[str],
+) -> None:
+    clustering_summary = {
+        "target_features": target_features,
+        "comparisons": {},
+    }
+
+    for comparison_name, (source, selection_key) in DEFAULT_OVERLAP_SELECTIONS.items():
+        clustering_summary["comparisons"][comparison_name] = (
+            _build_hierarchical_clustering_summary(
+                grouped_layer_entries,
+                source,
+                selection_key,
+                target_features,
+            )
+        )
+
+    output_path = os.path.join(output_dir, "hierarchical_clustering_summary.json")
+    save_json_results(clustering_summary, output_path)
+    print(f"Saved hierarchical clustering summary: {output_path}")
+    _save_hierarchical_dendrograms(clustering_summary, output_dir)
 
 
 def _save_evolution_plots_for_all_features(
@@ -523,18 +828,16 @@ def _save_evolution_plots_for_all_features(
             print(f"Saved evolution plot: {output_path}")
 
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Postprocess per-layer crosslayer outputs for the full modal set "
-            "(will/can/could/may/might/must/should/would/suppose)."
+            "Postprocess per-layer crosslayer outputs for modal/suppose/know runs."
         )
     )
     parser.add_argument(
         "--input-dir",
         required=True,
-        help="Directory containing per-layer JSONs for all modal features.",
+        help="Directory containing per-layer JSONs for all target features.",
     )
     parser.add_argument(
         "--output-dir",
@@ -545,7 +848,7 @@ def main() -> None:
         "--plot",
         action="store_true",
         help=(
-            "Generate cross-layer plots for all modal features across top100, "
+            "Generate cross-layer plots for all target features across top3, top100, "
             "Lasso top10/top20/top50/top100, and ElasticNet top10/top20/top50/top100."
         ),
     )
@@ -558,26 +861,53 @@ def main() -> None:
         "--compare-modal-overlap",
         action="store_true",
         help=(
-            "Compare layer-wise index overlap across the full modal set for top100, "
+            "Compare layer-wise index overlap across the target feature set for top3, top100, "
             "Lasso, and ElasticNet."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-hierarchical",
+        action="store_true",
+        help=(
+            "Run hierarchical clustering from layer-wise Jaccard distances using "
+            "average/complete/single linkage, and evaluate know-vs-others plus "
+            "suppose-vs-modal-verb separation."
+        ),
+    )
+    parser.add_argument(
+        "--target-features",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional explicit feature list. Default: detect all feature names "
+            "present under --input-dir."
         ),
     )
 
     args = parser.parse_args()
-    if not args.plot and not args.compare_modal_overlap:
+    if not args.plot and not args.compare_modal_overlap and not args.cluster_hierarchical:
         raise ValueError(
-            "Specify at least one of --plot or --compare-modal-overlap."
+            "Specify at least one of --plot, --compare-modal-overlap, or --cluster-hierarchical."
         )
 
     output_dir = args.output_dir or args.input_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    target_features = list(MODAL_FEATURE_NAMES)
     grouped_layer_entries = _load_grouped_layer_results(args.input_dir)
-    _validate_required_modal_features(grouped_layer_entries, target_features)
+    target_features = _resolve_target_features(
+        grouped_layer_entries,
+        args.target_features,
+    )
 
     if args.compare_modal_overlap:
         _save_modal_overlap_summary(
+            grouped_layer_entries,
+            output_dir,
+            target_features,
+        )
+
+    if args.cluster_hierarchical:
+        _save_hierarchical_clustering_summary(
             grouped_layer_entries,
             output_dir,
             target_features,

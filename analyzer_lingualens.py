@@ -50,6 +50,50 @@ class BaseTrainSaeLinguisticAnalyzer:
         self.tokenizer = setup_tokenizer(model_path)
         self._model_cache: Dict[int, Any] = {}
 
+    def _build_layer_analysis_result(
+        self,
+        feature_file: str,
+        total_examples: int,
+        layer_idx: int,
+        top_k: int,
+        layer_stats: Dict[int, Dict[str, float]],
+        sentence_feature_rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        feature_name = os.path.splitext(os.path.basename(feature_file))[0]
+        layer_result: Dict[str, Any] = {
+            "feature_file": feature_file,
+            "total_examples": total_examples,
+            "layers_analyzed": [layer_idx],
+            "top_k": top_k,
+            "layer_results": {},
+            "unified_results": [],
+        }
+        if sentence_feature_rows is not None:
+            layer_result["sentence_feature_rows"] = sentence_feature_rows
+
+        if layer_stats:
+            top_features = get_top_features_by_frc(layer_stats, top_k)
+            layer_result["layer_results"][layer_idx] = {
+                "total_base_vectors": len(layer_stats),
+                "top_features": top_features,
+                "full_stats": layer_stats,
+            }
+            for base_vector, _ in top_features[:3]:
+                stats = layer_stats[base_vector]
+                layer_result["unified_results"].append(
+                    {
+                        "feature": feature_name,
+                        "layer": layer_idx,
+                        "base_vector": int(base_vector),
+                        "ps": stats["ps"],
+                        "pn": stats["pn"],
+                        "frc": stats["frc"],
+                        "avg_max_activation": stats["avg_max_activation"],
+                    }
+                )
+
+        return layer_result
+
     def analyze_feature(
         self,
         feature_file: str,
@@ -68,6 +112,7 @@ class BaseTrainSaeLinguisticAnalyzer:
         }
 
         progress = ProgressLogger(len(layers), "Analyzing layers")
+        feature_name = os.path.splitext(os.path.basename(feature_file))[0]
 
         for layer_position, layer_idx in enumerate(layers, start=1):
             print(
@@ -85,8 +130,7 @@ class BaseTrainSaeLinguisticAnalyzer:
                         "full_stats": layer_stats,
                     }
 
-                    feature_name = os.path.splitext(os.path.basename(feature_file))[0]
-                    for base_vector, frc_score in top_features[:3]:
+                    for base_vector, _ in top_features[:3]:
                         stats = layer_stats[base_vector]
                         results["unified_results"].append(
                             {
@@ -131,7 +175,6 @@ class BaseTrainSaeLinguisticAnalyzer:
         retain_sentence_activations: bool = False,
     ) -> Dict[str, Any]:
         lines = load_text_data(feature_file)
-        feature_name = os.path.splitext(os.path.basename(feature_file))[0]
         layer_label = (
             f"[layer {layer_position}/{total_layers}]"
             if layer_position is not None and total_layers is not None
@@ -151,38 +194,16 @@ class BaseTrainSaeLinguisticAnalyzer:
         else:
             layer_stats = analysis_output
             sentence_feature_rows = []
-        layer_result: Dict[str, Any] = {
-            "feature_file": feature_file,
-            "total_examples": len(lines),
-            "layers_analyzed": [layer_idx],
-            "top_k": top_k,
-            "layer_results": {},
-            "unified_results": [],
-        }
-        if retain_sentence_activations:
-            layer_result["sentence_feature_rows"] = sentence_feature_rows
-
+        layer_result = self._build_layer_analysis_result(
+            feature_file=feature_file,
+            total_examples=len(lines),
+            layer_idx=layer_idx,
+            top_k=top_k,
+            layer_stats=layer_stats,
+            sentence_feature_rows=sentence_feature_rows if retain_sentence_activations else None,
+        )
         if layer_stats:
-            top_features = get_top_features_by_frc(layer_stats, top_k)
-            layer_result["layer_results"][layer_idx] = {
-                "total_base_vectors": len(layer_stats),
-                "top_features": top_features,
-                "full_stats": layer_stats,
-            }
-            for base_vector, _ in top_features[:3]:
-                stats = layer_stats[base_vector]
-                layer_result["unified_results"].append(
-                    {
-                        "feature": feature_name,
-                        "layer": layer_idx,
-                        "base_vector": int(base_vector),
-                        "ps": stats["ps"],
-                        "pn": stats["pn"],
-                        "frc": stats["frc"],
-                        "avg_max_activation": stats["avg_max_activation"],
-                    }
-                )
-
+            top_features = layer_result["layer_results"][layer_idx]["top_features"]
             top_frc = float(top_features[0][1]) if top_features else float("nan")
             print(
                 f"{layer_label} done: layer={layer_idx}, base_vectors={len(layer_stats)}, "
@@ -296,6 +317,34 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
         self._base_model = model
         return model
 
+    def _tokenize_batch(
+        self,
+        batch_lines: List[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        enc = self.tokenizer(
+            batch_lines,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        return input_ids, attention_mask.to(self.device)
+
+    def _extract_hook_activations(
+        self,
+        hook: SimpleHook,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        acts = hook.output
+        if isinstance(acts, tuple):
+            acts = acts[0]
+        if acts.dim() == 2:
+            acts = acts.unsqueeze(0)
+        return acts[:, 1:, :], attention_mask[:, 1:]
+
     def _resolve_layer_modules(self) -> Dict[str, Any]:
         if self._layer_modules is not None:
             return self._layer_modules
@@ -371,40 +420,97 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
         self._model_cache[layer_idx] = runtime
         return runtime
 
-    def _analyze_single_layer(
+    def _collect_layer_structured_batch(
+        self,
+        input_ids: torch.Tensor,
+        acts: torch.Tensor,
+        token_mask: torch.Tensor,
+        sae: SparseAutoEncoder,
+        start: int,
+        retain_sentence_activations: bool,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        structured_batch: List[Dict[str, Any]] = []
+        sentence_feature_rows: List[Dict[str, Any]] = []
+
+        for i in range(input_ids.size(0)):
+            valid_len = int(token_mask[i].sum().item())
+            token_ids = input_ids[i, 1 : valid_len + 1]
+            tokens = self.tokenizer.convert_ids_to_tokens(token_ids.tolist())
+            tokens = [tok.replace("▁", " ") for tok in tokens]
+
+            sentence_tokens: List[Dict[str, Any]] = []
+            sentence_latent_activations: Dict[int, float] = {}
+            if valid_len > 0:
+                activation = acts[i, :valid_len, :]
+                activation = normalize_activation(activation, self.normalization)
+                activation = activation.to(self.device)
+
+                with torch.no_grad():
+                    out = sae(activation)
+
+                top_indices = out.latent_indices.detach().cpu().tolist()
+                top_acts = out.latent_acts.detach().cpu().tolist()
+
+                for token, idxs, vals in zip(tokens, top_indices, top_acts):
+                    token_activations = []
+                    for base_vector, value in zip(idxs, vals):
+                        if value > 0:
+                            current_value = sentence_latent_activations.get(
+                                int(base_vector), 0.0
+                            )
+                            if value > current_value:
+                                sentence_latent_activations[int(base_vector)] = float(value)
+                            token_activations.append(
+                                {
+                                    "base_vector": int(base_vector),
+                                    "activation": float(value),
+                                }
+                            )
+                    sentence_tokens.append(
+                        {"token": token, "activations": token_activations}
+                    )
+
+            structured_batch.append(
+                {
+                    "sentence_id": start + i + 1,
+                    "tokens": sentence_tokens,
+                }
+            )
+            if retain_sentence_activations:
+                sentence_id = start + i + 1
+                sentence_feature_rows.append(
+                    {
+                        "sentence_id": sentence_id,
+                        "label": 1 if sentence_id % 2 == 1 else 0,
+                        "line_type": "original" if sentence_id % 2 == 1 else "minimal_pair",
+                        "latent_activations": sentence_latent_activations,
+                    }
+                )
+
+        return structured_batch, sentence_feature_rows
+
+    def _analyze_multiple_layers(
         self,
         lines: List[str],
-        layer_idx: int,
+        layers: List[int],
         retain_sentence_activations: bool = False,
-    ) -> Dict[str, Any] | Dict[int, Dict[str, float]]:
-        runtime = self._get_sae_model(layer_idx)
+    ) -> Dict[int, Dict[str, Any]]:
         model = self._load_base_model()
-        sae: SparseAutoEncoder = runtime["sae"]
-        hook: SimpleHook = runtime["hook"]
-
-        structured_data: List[Dict[str, Any]] = []
-        sentence_feature_rows: List[Dict[str, Any]] = []
+        runtimes = {layer_idx: self._get_sae_model(layer_idx) for layer_idx in layers}
+        structured_data_by_layer = {layer_idx: [] for layer_idx in layers}
+        sentence_rows_by_layer = {layer_idx: [] for layer_idx in layers}
         total_batches = max(1, (len(lines) + self.batch_size - 1) // self.batch_size)
         log_interval = max(1, total_batches // 10)
 
         for batch_idx, start in enumerate(range(0, len(lines), self.batch_size), start=1):
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % log_interval == 0:
                 print(
-                    f"  layer {layer_idx}: batch {batch_idx}/{total_batches} "
+                    f"  shared forward: batch {batch_idx}/{total_batches} "
                     f"(examples {start + 1}-{min(start + self.batch_size, len(lines))}/{len(lines)})"
                 )
+
             batch_lines = lines[start : start + self.batch_size]
-            enc = self.tokenizer(
-                batch_lines,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-            )
-            input_ids = enc["input_ids"].to(self.device)
-            attention_mask = enc.get("attention_mask")
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids)
-            attention_mask = attention_mask.to(self.device)
+            input_ids, attention_mask = self._tokenize_batch(batch_lines)
 
             with torch.no_grad():
                 _ = model(
@@ -413,78 +519,119 @@ class TrainSaeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
                     use_cache=False,
                 )
 
-            acts = hook.output
-            if isinstance(acts, tuple):
-                acts = acts[0]
-            if acts.dim() == 2:
-                acts = acts.unsqueeze(0)
-            acts = acts[:, 1:, :]
-            token_mask = attention_mask[:, 1:]
-
-            for i in range(input_ids.size(0)):
-                valid_len = int(token_mask[i].sum().item())
-                token_ids = input_ids[i, 1 : valid_len + 1]
-                tokens = self.tokenizer.convert_ids_to_tokens(token_ids.tolist())
-                tokens = [tok.replace("▁", " ") for tok in tokens]
-
-                sentence_tokens: List[Dict[str, Any]] = []
-                sentence_latent_activations: Dict[int, float] = {}
-                if valid_len > 0:
-                    activation = acts[i, :valid_len, :]
-                    activation = normalize_activation(activation, self.normalization)
-                    activation = activation.to(self.device)
-
-                    with torch.no_grad():
-                        out = sae(activation)
-
-                    top_indices = out.latent_indices.detach().cpu().tolist()
-                    top_acts = out.latent_acts.detach().cpu().tolist()
-
-                    for token, idxs, vals in zip(tokens, top_indices, top_acts):
-                        token_activations = []
-                        for base_vector, value in zip(idxs, vals):
-                            if value > 0:
-                                current_value = sentence_latent_activations.get(
-                                    int(base_vector), 0.0
-                                )
-                                if value > current_value:
-                                    sentence_latent_activations[int(base_vector)] = float(value)
-                                token_activations.append(
-                                    {
-                                        "base_vector": int(base_vector),
-                                        "activation": float(value),
-                                    }
-                                )
-                        sentence_tokens.append(
-                            {"token": token, "activations": token_activations}
-                        )
-
-                structured_data.append(
-                    {
-                        "sentence_id": start + i + 1,
-                        "tokens": sentence_tokens,
-                    }
+            for layer_idx in layers:
+                runtime = runtimes[layer_idx]
+                hook: SimpleHook = runtime["hook"]
+                sae: SparseAutoEncoder = runtime["sae"]
+                acts, token_mask = self._extract_hook_activations(hook, attention_mask)
+                structured_batch, sentence_feature_rows = self._collect_layer_structured_batch(
+                    input_ids=input_ids,
+                    acts=acts,
+                    token_mask=token_mask,
+                    sae=sae,
+                    start=start,
+                    retain_sentence_activations=retain_sentence_activations,
                 )
+                structured_data_by_layer[layer_idx].extend(structured_batch)
                 if retain_sentence_activations:
-                    sentence_id = start + i + 1
-                    sentence_feature_rows.append(
-                        {
-                            "sentence_id": sentence_id,
-                            "label": 1 if sentence_id % 2 == 1 else 0,
-                            "line_type": "original" if sentence_id % 2 == 1 else "minimal_pair",
-                            "latent_activations": sentence_latent_activations,
-                        }
-                    )
+                    sentence_rows_by_layer[layer_idx].extend(sentence_feature_rows)
+                hook.output = None
 
-            hook.output = None
-
-        layer_stats = compute_layer_stats(structured_data)
-        if retain_sentence_activations:
-            return {
-                "layer_stats": layer_stats,
-                "sentence_feature_rows": sentence_feature_rows,
+        layer_outputs: Dict[int, Dict[str, Any]] = {}
+        for layer_idx in layers:
+            layer_outputs[layer_idx] = {
+                "layer_stats": compute_layer_stats(structured_data_by_layer[layer_idx])
             }
-        return layer_stats
+            if retain_sentence_activations:
+                layer_outputs[layer_idx]["sentence_feature_rows"] = sentence_rows_by_layer[
+                    layer_idx
+                ]
+
+        return layer_outputs
+
+    def analyze_feature(
+        self,
+        feature_file: str,
+        layers: List[int],
+        top_k: int = 10,
+    ) -> Dict[str, Any]:
+        lines = load_text_data(feature_file)
+        results = {
+            "feature_file": feature_file,
+            "total_examples": len(lines),
+            "layers_analyzed": layers,
+            "top_k": top_k,
+            "layer_results": {},
+            "unified_results": [],
+        }
+
+        progress = ProgressLogger(len(layers), "Analyzing layers")
+        feature_name = os.path.splitext(os.path.basename(feature_file))[0]
+        analysis_by_layer = self._analyze_multiple_layers(lines, layers)
+
+        for layer_position, layer_idx in enumerate(layers, start=1):
+            print(
+                f"[layer {layer_position}/{len(layers)}] finalize: "
+                f"layer={layer_idx}, top_k={top_k}"
+            )
+            layer_start = time.perf_counter()
+            try:
+                layer_stats = analysis_by_layer[layer_idx]["layer_stats"]
+                if layer_stats:
+                    top_features = get_top_features_by_frc(layer_stats, top_k)
+                    results["layer_results"][layer_idx] = {
+                        "total_base_vectors": len(layer_stats),
+                        "top_features": top_features,
+                        "full_stats": layer_stats,
+                    }
+                    for base_vector, _ in top_features[:3]:
+                        stats = layer_stats[base_vector]
+                        results["unified_results"].append(
+                            {
+                                "feature": feature_name,
+                                "layer": layer_idx,
+                                "base_vector": int(base_vector),
+                                "ps": stats["ps"],
+                                "pn": stats["pn"],
+                                "frc": stats["frc"],
+                                "avg_max_activation": stats["avg_max_activation"],
+                            }
+                        )
+                    top_frc = float(top_features[0][1]) if top_features else float("nan")
+                    print(
+                        f"[layer {layer_position}/{len(layers)}] done: "
+                        f"layer={layer_idx}, base_vectors={len(layer_stats)}, "
+                        f"top_frc={top_frc:.4f}, elapsed={time.perf_counter() - layer_start:.1f}s"
+                    )
+                else:
+                    print(
+                        f"[layer {layer_position}/{len(layers)}] done: "
+                        f"layer={layer_idx}, base_vectors=0, "
+                        f"elapsed={time.perf_counter() - layer_start:.1f}s"
+                    )
+                progress.update()
+            except Exception as exc:
+                print(f"Error analyzing layer {layer_idx}: {exc}")
+                results["layer_results"][layer_idx] = {"error": str(exc)}
+                progress.update()
+
+        progress.finish()
+        return results
+
+    def _analyze_single_layer(
+        self,
+        lines: List[str],
+        layer_idx: int,
+        retain_sentence_activations: bool = False,
+    ) -> Dict[str, Any] | Dict[int, Dict[str, float]]:
+        layer_output = self._analyze_multiple_layers(
+            lines,
+            [layer_idx],
+            retain_sentence_activations=retain_sentence_activations,
+        )[layer_idx]
+        if retain_sentence_activations:
+            return layer_output
+        return layer_output["layer_stats"]
 
     def clear_cache(self):
         for runtime in self._model_cache.values():

@@ -75,6 +75,11 @@ class LlamaScopeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
             sae_path,
             fold_activation_scale=self.fold_activation_scale,
         ).to(self.device)
+        # Keep the config device in sync with the actual module device. Some
+        # lm_saes encode paths call helper methods that materialize tensors via
+        # `self.cfg.device` instead of the parameter device.
+        if hasattr(sae, "cfg") and hasattr(sae.cfg, "device"):
+            sae.cfg.device = str(self.device)
         sae.eval()
         return sae
 
@@ -220,6 +225,9 @@ class LlamaScopeLinguisticAnalyzer(BaseTrainSaeLinguisticAnalyzer):
                 runtime = runtimes[layer_idx]
                 sae: SparseDictionary = runtime["sae"]
                 acts = cache[runtime["hook_point_in"]]
+                sae_device = next(sae.parameters()).device
+                if acts.device != sae_device:
+                    acts = acts.to(sae_device)
                 with torch.no_grad():
                     feature_acts = sae.encode(acts)
                 structured_batch, sentence_feature_rows = self._collect_layer_structured_batch(

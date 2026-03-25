@@ -36,6 +36,4 @@ run_scope_group() {
 }
 
 # run_scope_group "will,can,could,may,might,must,should,would" "data/minimal_pairs_acceptability.jsonl"
-run_scope_group "would" "data/minimal_pairs_acceptability.jsonl"
-run_scope_group "suppose" "data/minimal_pairs_acceptability_2.jsonl"
 run_scope_group "know" "data/minimal_pairs_acceptability_3.jsonl"
